@@ -16,53 +16,32 @@ let lastScan = null;
 let scanLog = [];
 let scanning = false;
 
-// ─── Claude research engine ───────────────────────────────────────────────────
+// ─── Claude research ──────────────────────────────────────────────────────────
 
 async function researchProducts() {
   console.log('Running Claude product research...');
 
-  const prompt = `You are a dropshipping product researcher. Search the web for physical products trending right now that would make good dropshipping products.
+  const prompt = `Search the web for physical products trending right now for dropshipping. Search for "tiktok trending products 2026" and "amazon best sellers this week".
 
-Search for: tiktok trending products this week, amazon best sellers rising, viral products to buy online 2026.
+Respond with ONLY a JSON array. No intro text, no explanation, no markdown. Start your response with [ and end with ].
 
-Return ONLY a JSON array, no other text:
-[
-  {
-    "name": "Product Name",
-    "category": "home/fitness/kitchen/gadgets/beauty/outdoor/pet/office",
-    "tiktok": 75,
-    "amazon": 68,
-    "reddit": 55,
-    "margin": 65,
-    "signals": ["tiktok","amazon"],
-    "source": "tiktok",
-    "retailPrice": "$29.99",
-    "wholesaleEstimate": "$8-12",
-    "whyTrending": "Specific reason with real data points",
-    "whyDropship": "Why good for dropshipping",
-    "tiktokUrl": "real url or null",
-    "amazonUrl": "real url or null",
-    "redditUrl": "real url or null",
-    "imageUrl": "real image url or null",
-    "searchQuery": "aliexpress search term"
-  }
-]
+Example format:
+[{"name":"LED Sunset Lamp","category":"home decor","tiktok":82,"amazon":71,"reddit":55,"margin":68,"signals":["tiktok","amazon"],"source":"tiktok","retailPrice":"$24.99","wholesaleEstimate":"$6-9","whyTrending":"Viral on TikTok with 5M views this week","whyDropship":"High margin, easy to ship, no brand restrictions","tiktokUrl":null,"amazonUrl":"https://amazon.com/s?k=led+sunset+lamp","redditUrl":null,"imageUrl":null,"searchQuery":"LED sunset projection lamp"}]
 
-Find 10 products. Only physical goods. No food, regulated items, or branded products. signals only includes sources with score >= 65.`;
+Find 8 products. Only physical goods. No food or regulated items.`;
 
   try {
     const messages = [{ role: 'user', content: prompt }];
-
     let response = await client.messages.create({
       model: 'claude-haiku-4-5-20251001',
-      max_tokens: 4000,
+      max_tokens: 3000,
       tools: [{ type: 'web_search_20250305', name: 'web_search' }],
       messages,
     });
 
-    // Agentic loop
+    // Agentic loop — max 4 search rounds
     let loops = 0;
-    while (response.stop_reason === 'tool_use' && loops < 5) {
+    while (response.stop_reason === 'tool_use' && loops < 4) {
       loops++;
       const toolResults = [];
       for (const block of response.content) {
@@ -79,29 +58,77 @@ Find 10 products. Only physical goods. No food, regulated items, or branded prod
       messages.push({ role: 'user', content: toolResults });
       response = await client.messages.create({
         model: 'claude-haiku-4-5-20251001',
-        max_tokens: 4000,
+        max_tokens: 3000,
         tools: [{ type: 'web_search_20250305', name: 'web_search' }],
         messages,
       });
     }
 
+    // Extract all text blocks
     const finalText = response.content
       .filter(b => b.type === 'text')
       .map(b => b.text)
       .join('');
 
-    const clean = finalText.replace(/```json/g, '').replace(/```/g, '').trim();
-    const start = clean.indexOf('[');
-    const end = clean.lastIndexOf(']');
-    if (start === -1 || end === -1) throw new Error('No JSON array in response');
+    console.log('Raw response preview:', finalText.slice(0, 200));
 
-    const parsed = JSON.parse(clean.slice(start, end + 1));
-    console.log(`Claude found ${parsed.length} products`);
-    return parsed;
+    // Try to extract JSON array — handle markdown fences, leading text etc
+    const parsed = extractJSON(finalText);
+    if (parsed) {
+      console.log(`Claude found ${parsed.length} products`);
+      return parsed;
+    }
+
+    // If still no JSON — ask Claude to reformat
+    console.log('No JSON found, asking Claude to reformat...');
+    messages.push({ role: 'assistant', content: response.content });
+    messages.push({
+      role: 'user',
+      content: 'Your response did not contain valid JSON. Please respond with ONLY the JSON array, starting with [ and ending with ]. Nothing else.',
+    });
+    const retry = await client.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 3000,
+      messages,
+    });
+    const retryText = retry.content.filter(b => b.type === 'text').map(b => b.text).join('');
+    console.log('Retry preview:', retryText.slice(0, 200));
+    const retryParsed = extractJSON(retryText);
+    if (retryParsed) {
+      console.log(`Claude found ${retryParsed.length} products on retry`);
+      return retryParsed;
+    }
+
+    throw new Error('Could not extract JSON after retry');
 
   } catch (err) {
     console.error('Claude research error:', err.message);
     return [];
+  }
+}
+
+function extractJSON(text) {
+  if (!text) return null;
+  // Strip markdown fences
+  let clean = text.replace(/```json/gi, '').replace(/```/g, '').trim();
+  // Find outermost array
+  const start = clean.indexOf('[');
+  const end = clean.lastIndexOf(']');
+  if (start === -1 || end === -1 || end <= start) return null;
+  try {
+    const arr = JSON.parse(clean.slice(start, end + 1));
+    if (Array.isArray(arr) && arr.length > 0) return arr;
+    return null;
+  } catch (e) {
+    // Try to fix common JSON issues — trailing commas
+    try {
+      const fixed = clean.slice(start, end + 1)
+        .replace(/,\s*}/g, '}')
+        .replace(/,\s*]/g, ']');
+      const arr = JSON.parse(fixed);
+      if (Array.isArray(arr) && arr.length > 0) return arr;
+    } catch (e2) { /* fall through */ }
+    return null;
   }
 }
 
@@ -111,26 +138,26 @@ function clamp(v) { return Math.min(100, Math.max(0, Math.round(Number(v) || 0))
 
 function processProducts(raw) {
   return raw
-    .filter(p => p.name)
+    .filter(p => p && p.name)
     .map((p, i) => ({
       id: `p_${Date.now()}_${i}`,
-      name: p.name,
+      name: String(p.name).slice(0, 80),
       category: p.category || 'general',
       tiktok: clamp(p.tiktok),
       amazon: clamp(p.amazon),
       reddit: clamp(p.reddit),
       margin: clamp(p.margin),
       score: Math.round(clamp(p.tiktok)*0.40 + clamp(p.amazon)*0.30 + clamp(p.reddit)*0.15 + clamp(p.margin)*0.15),
-      signals: p.signals || [],
+      signals: Array.isArray(p.signals) ? p.signals : [],
       source: p.source || 'web',
       retailPrice: p.retailPrice || null,
       wholesaleEstimate: p.wholesaleEstimate || null,
       whyTrending: p.whyTrending || '',
       whyDropship: p.whyDropship || '',
-      tiktokUrl: p.tiktokUrl && p.tiktokUrl !== 'null' ? p.tiktokUrl : null,
-      amazonUrl: p.amazonUrl && p.amazonUrl !== 'null' ? p.amazonUrl : null,
-      redditUrl: p.redditUrl && p.redditUrl !== 'null' ? p.redditUrl : null,
-      imageUrl: p.imageUrl && p.imageUrl !== 'null' ? p.imageUrl : null,
+      tiktokUrl: validUrl(p.tiktokUrl),
+      amazonUrl: validUrl(p.amazonUrl),
+      redditUrl: validUrl(p.redditUrl),
+      imageUrl: validUrl(p.imageUrl),
       searchQuery: p.searchQuery || p.name,
       scannedAt: new Date().toISOString(),
     }))
@@ -138,12 +165,21 @@ function processProducts(raw) {
     .slice(0, 20);
 }
 
+function validUrl(u) {
+  if (!u || u === 'null' || u === 'undefined') return null;
+  try { new URL(u); return u; } catch { return null; }
+}
+
 // ─── Scan ─────────────────────────────────────────────────────────────────────
 
 async function runScan() {
   console.log(`\n[${new Date().toISOString()}] Starting scan...`);
   const raw = await researchProducts();
-  products = processProducts(raw);
+  if (raw.length > 0) {
+    products = processProducts(raw);
+  } else {
+    console.log('No products returned — keeping previous results');
+  }
   lastScan = new Date().toISOString();
   scanLog.unshift({ scannedAt: lastScan, count: products.length });
   if (scanLog.length > 20) scanLog = scanLog.slice(0, 20);
