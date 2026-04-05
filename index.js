@@ -19,69 +19,51 @@ let scanning = false;
 // ─── Claude research engine ───────────────────────────────────────────────────
 
 async function researchProducts() {
-  console.log('Running Claude product research with web search...');
+  console.log('Running Claude product research...');
 
-  const prompt = `You are an expert dropshipping product researcher. Use web search extensively to find physical products trending RIGHT NOW that would be great dropshipping candidates.
+  const prompt = `You are a dropshipping product researcher. Search the web for physical products trending right now that would make good dropshipping products.
 
-Search for ALL of the following:
-1. "tiktok trending products this week 2026"
-2. "amazon best sellers rising 2026"
-3. "reddit shutupandtakemymoney top posts this week"
-4. "reddit amazonfinds trending"
-5. "viral products to sell online 2026"
-6. Any specific products you find — search each one individually to get more detail
+Search for: tiktok trending products this week, amazon best sellers rising, viral products to buy online 2026.
 
-For each product you identify, I need RICH details. Search for each product individually to find:
-- Real product links (Amazon listing URL, TikTok video URL, Reddit post URL — actual URLs you find)
-- Real image URLs from product pages or listings
-- Specific reasons why it is trending (viral video views, Amazon rank, Reddit upvotes etc)
-- Price range (what it sells for retail)
-- Estimated wholesale/supplier cost
-- Why it would make a good dropship product
-
-Return ONLY a valid JSON array with this exact structure, no markdown, no explanation, just the array:
+Return ONLY a JSON array, no other text:
 [
   {
-    "name": "Exact Product Name",
-    "category": "home decor / fitness / kitchen / gadgets / beauty / outdoor / pet / office",
-    "tiktok": 82,
-    "amazon": 74,
-    "reddit": 61,
+    "name": "Product Name",
+    "category": "home/fitness/kitchen/gadgets/beauty/outdoor/pet/office",
+    "tiktok": 75,
+    "amazon": 68,
+    "reddit": 55,
     "margin": 65,
-    "signals": ["tiktok", "amazon"],
+    "signals": ["tiktok","amazon"],
     "source": "tiktok",
     "retailPrice": "$29.99",
     "wholesaleEstimate": "$8-12",
-    "whyTrending": "Specific reason this is trending right now with real data points — views, rank, upvotes etc",
-    "whyDropship": "Why this is a good dropship product — margin, demand, competition level",
-    "tiktokUrl": "https://www.tiktok.com/... or null if not found",
-    "amazonUrl": "https://www.amazon.com/... or null if not found",
-    "redditUrl": "https://www.reddit.com/... or null if not found",
-    "imageUrl": "https://... real product image URL or null",
-    "searchQuery": "exact search term someone would use to find this product on AliExpress or Alibaba"
+    "whyTrending": "Specific reason with real data points",
+    "whyDropship": "Why good for dropshipping",
+    "tiktokUrl": "real url or null",
+    "amazonUrl": "real url or null",
+    "redditUrl": "real url or null",
+    "imageUrl": "real image url or null",
+    "searchQuery": "aliexpress search term"
   }
 ]
 
-Rules:
-- Only physical products — no food, no regulated items, no branded/trademarked products
-- Aim for 12-18 products
-- signals array only includes sources where score >= 65
-- ALL URLs must be real URLs you actually found during your searches — use null if you did not find one
-- imageUrl should be a direct image URL ending in .jpg .png .webp if possible
-- whyTrending must include specific data points (views counts, rank numbers, upvote counts)
-- Make scores realistic based on actual evidence you found`;
+Find 10 products. Only physical goods. No food, regulated items, or branded products. signals only includes sources with score >= 65.`;
 
   try {
     const messages = [{ role: 'user', content: prompt }];
+
     let response = await client.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 8000,
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 4000,
       tools: [{ type: 'web_search_20250305', name: 'web_search' }],
       messages,
     });
 
-    // Agentic loop — keep going until Claude stops using tools
-    while (response.stop_reason === 'tool_use') {
+    // Agentic loop
+    let loops = 0;
+    while (response.stop_reason === 'tool_use' && loops < 5) {
+      loops++;
       const toolResults = [];
       for (const block of response.content) {
         if (block.type === 'tool_use') {
@@ -89,33 +71,32 @@ Rules:
           toolResults.push({
             type: 'tool_result',
             tool_use_id: block.id,
-            content: 'Search executed successfully',
+            content: 'Search completed',
           });
         }
       }
       messages.push({ role: 'assistant', content: response.content });
       messages.push({ role: 'user', content: toolResults });
       response = await client.messages.create({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 8000,
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 4000,
         tools: [{ type: 'web_search_20250305', name: 'web_search' }],
         messages,
       });
     }
 
-    // Extract final text
     const finalText = response.content
       .filter(b => b.type === 'text')
       .map(b => b.text)
       .join('');
 
-    // Parse JSON
     const clean = finalText.replace(/```json/g, '').replace(/```/g, '').trim();
-    const startIdx = clean.indexOf('[');
-    const endIdx = clean.lastIndexOf(']');
-    if (startIdx === -1 || endIdx === -1) throw new Error('No JSON array in response');
-    const parsed = JSON.parse(clean.slice(startIdx, endIdx + 1));
-    console.log(`Claude found ${parsed.length} products with rich data`);
+    const start = clean.indexOf('[');
+    const end = clean.lastIndexOf(']');
+    if (start === -1 || end === -1) throw new Error('No JSON array in response');
+
+    const parsed = JSON.parse(clean.slice(start, end + 1));
+    console.log(`Claude found ${parsed.length} products`);
     return parsed;
 
   } catch (err) {
@@ -124,7 +105,9 @@ Rules:
   }
 }
 
-// ─── Process and score ────────────────────────────────────────────────────────
+// ─── Process ──────────────────────────────────────────────────────────────────
+
+function clamp(v) { return Math.min(100, Math.max(0, Math.round(Number(v) || 0))); }
 
 function processProducts(raw) {
   return raw
@@ -137,17 +120,17 @@ function processProducts(raw) {
       amazon: clamp(p.amazon),
       reddit: clamp(p.reddit),
       margin: clamp(p.margin),
-      score: Math.round(clamp(p.tiktok) * 0.40 + clamp(p.amazon) * 0.30 + clamp(p.reddit) * 0.15 + clamp(p.margin) * 0.15),
+      score: Math.round(clamp(p.tiktok)*0.40 + clamp(p.amazon)*0.30 + clamp(p.reddit)*0.15 + clamp(p.margin)*0.15),
       signals: p.signals || [],
       source: p.source || 'web',
       retailPrice: p.retailPrice || null,
       wholesaleEstimate: p.wholesaleEstimate || null,
       whyTrending: p.whyTrending || '',
       whyDropship: p.whyDropship || '',
-      tiktokUrl: p.tiktokUrl || null,
-      amazonUrl: p.amazonUrl || null,
-      redditUrl: p.redditUrl || null,
-      imageUrl: p.imageUrl || null,
+      tiktokUrl: p.tiktokUrl && p.tiktokUrl !== 'null' ? p.tiktokUrl : null,
+      amazonUrl: p.amazonUrl && p.amazonUrl !== 'null' ? p.amazonUrl : null,
+      redditUrl: p.redditUrl && p.redditUrl !== 'null' ? p.redditUrl : null,
+      imageUrl: p.imageUrl && p.imageUrl !== 'null' ? p.imageUrl : null,
       searchQuery: p.searchQuery || p.name,
       scannedAt: new Date().toISOString(),
     }))
@@ -155,9 +138,7 @@ function processProducts(raw) {
     .slice(0, 20);
 }
 
-function clamp(v) { return Math.min(100, Math.max(0, Math.round(Number(v) || 0))); }
-
-// ─── Main scan ────────────────────────────────────────────────────────────────
+// ─── Scan ─────────────────────────────────────────────────────────────────────
 
 async function runScan() {
   console.log(`\n[${new Date().toISOString()}] Starting scan...`);
@@ -166,18 +147,18 @@ async function runScan() {
   lastScan = new Date().toISOString();
   scanLog.unshift({ scannedAt: lastScan, count: products.length });
   if (scanLog.length > 20) scanLog = scanLog.slice(0, 20);
-  console.log(`Scan complete. ${products.length} products scored.`);
+  console.log(`Scan complete. ${products.length} products.`);
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', lastScan, productCount: products.length });
-});
+app.get('/health', (req, res) => res.json({ status: 'ok', lastScan, productCount: products.length }));
 
-app.get('/products', (req, res) => {
-  res.json({ products, lastScan, nextScan: lastScan ? new Date(new Date(lastScan).getTime() + 3 * 60 * 60 * 1000).toISOString() : null, scanLog });
-});
+app.get('/products', (req, res) => res.json({
+  products, lastScan,
+  nextScan: lastScan ? new Date(new Date(lastScan).getTime() + 3*60*60*1000).toISOString() : null,
+  scanLog,
+}));
 
 app.post('/scan', async (req, res) => {
   res.json({ status: scanning ? 'already_scanning' : 'started' });
