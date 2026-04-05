@@ -15,20 +15,51 @@ let products = [];
 let lastScan = null;
 let scanLog = [];
 let scanning = false;
+let currentMinPrice = 0;
 
 // ─── Claude research ──────────────────────────────────────────────────────────
 
-async function researchProducts() {
-  console.log('Running Claude product research...');
+async function researchProducts(minPrice = 0) {
+  const priceContext = minPrice > 0
+    ? `IMPORTANT: Only find products that retail for $${minPrice} or more. Ignore cheap products under $${minPrice}.`
+    : 'Include products at any price point.';
 
-  const prompt = `Search the web for physical products trending right now for dropshipping. Search for "tiktok trending products 2026" and "amazon best sellers this week".
+  const priceSearch = minPrice > 0
+    ? `trending products over $${minPrice}, premium dropshipping products $${minPrice}+`
+    : 'tiktok trending products 2026, amazon best sellers rising this week';
 
-Respond with ONLY a JSON array. No intro text, no explanation, no markdown. Start your response with [ and end with ].
+  console.log(`Researching products — min price: ${minPrice > 0 ? '$' + minPrice : 'any'}`);
 
-Example format:
-[{"name":"LED Sunset Lamp","category":"home decor","tiktok":82,"amazon":71,"reddit":55,"margin":68,"signals":["tiktok","amazon"],"source":"tiktok","retailPrice":"$24.99","wholesaleEstimate":"$6-9","whyTrending":"Viral on TikTok with 5M views this week","whyDropship":"High margin, easy to ship, no brand restrictions","tiktokUrl":null,"amazonUrl":"https://amazon.com/s?k=led+sunset+lamp","redditUrl":null,"imageUrl":null,"searchQuery":"LED sunset projection lamp"}]
+  const prompt = `You are a dropshipping product researcher. Search the web for physical products trending right now.
 
-Find 8 products. Only physical goods. No food or regulated items.`;
+Search for: ${priceSearch}, viral products to sell online 2026.
+
+${priceContext}
+
+Return ONLY a JSON array, no other text, starting with [ and ending with ]:
+[
+  {
+    "name": "Product Name",
+    "category": "home/fitness/kitchen/gadgets/beauty/outdoor/pet/office",
+    "tiktok": 75,
+    "amazon": 68,
+    "reddit": 55,
+    "margin": 65,
+    "signals": ["tiktok","amazon"],
+    "source": "tiktok",
+    "retailPrice": "$49.99",
+    "wholesaleEstimate": "$14-18",
+    "whyTrending": "Specific reason with real data points",
+    "whyDropship": "Why good for dropshipping",
+    "tiktokUrl": null,
+    "amazonUrl": "https://amazon.com/s?k=product+name",
+    "redditUrl": null,
+    "imageUrl": null,
+    "searchQuery": "aliexpress search term"
+  }
+]
+
+Find 10 products. Only physical goods. No food, regulated items, or branded products. signals only includes sources with score >= 65.${minPrice > 0 ? ` Every product must have a retail price of $${minPrice} or higher.` : ''}`;
 
   try {
     const messages = [{ role: 'user', content: prompt }];
@@ -39,7 +70,6 @@ Find 8 products. Only physical goods. No food or regulated items.`;
       messages,
     });
 
-    // Agentic loop — max 4 search rounds
     let loops = 0;
     while (response.stop_reason === 'tool_use' && loops < 4) {
       loops++;
@@ -47,11 +77,7 @@ Find 8 products. Only physical goods. No food or regulated items.`;
       for (const block of response.content) {
         if (block.type === 'tool_use') {
           console.log(`  Searching: ${block.input?.query || '...'}`);
-          toolResults.push({
-            type: 'tool_result',
-            tool_use_id: block.id,
-            content: 'Search completed',
-          });
+          toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: 'Search completed' });
         }
       }
       messages.push({ role: 'assistant', content: response.content });
@@ -64,43 +90,26 @@ Find 8 products. Only physical goods. No food or regulated items.`;
       });
     }
 
-    // Extract all text blocks
-    const finalText = response.content
-      .filter(b => b.type === 'text')
-      .map(b => b.text)
-      .join('');
+    const finalText = response.content.filter(b => b.type === 'text').map(b => b.text).join('');
+    console.log('Response preview:', finalText.slice(0, 150));
 
-    console.log('Raw response preview:', finalText.slice(0, 200));
-
-    // Try to extract JSON array — handle markdown fences, leading text etc
     const parsed = extractJSON(finalText);
-    if (parsed) {
-      console.log(`Claude found ${parsed.length} products`);
-      return parsed;
-    }
+    if (parsed) { console.log(`Found ${parsed.length} products`); return parsed; }
 
-    // If still no JSON — ask Claude to reformat
-    console.log('No JSON found, asking Claude to reformat...');
+    // Retry — ask to reformat
+    console.log('Retrying JSON extraction...');
     messages.push({ role: 'assistant', content: response.content });
-    messages.push({
-      role: 'user',
-      content: 'Your response did not contain valid JSON. Please respond with ONLY the JSON array, starting with [ and ending with ]. Nothing else.',
-    });
+    messages.push({ role: 'user', content: 'Respond with ONLY the JSON array. Start with [ and end with ]. No other text.' });
     const retry = await client.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 3000,
       messages,
     });
     const retryText = retry.content.filter(b => b.type === 'text').map(b => b.text).join('');
-    console.log('Retry preview:', retryText.slice(0, 200));
     const retryParsed = extractJSON(retryText);
-    if (retryParsed) {
-      console.log(`Claude found ${retryParsed.length} products on retry`);
-      return retryParsed;
-    }
+    if (retryParsed) { console.log(`Found ${retryParsed.length} products on retry`); return retryParsed; }
 
     throw new Error('Could not extract JSON after retry');
-
   } catch (err) {
     console.error('Claude research error:', err.message);
     return [];
@@ -109,36 +118,41 @@ Find 8 products. Only physical goods. No food or regulated items.`;
 
 function extractJSON(text) {
   if (!text) return null;
-  // Strip markdown fences
   let clean = text.replace(/```json/gi, '').replace(/```/g, '').trim();
-  // Find outermost array
   const start = clean.indexOf('[');
   const end = clean.lastIndexOf(']');
   if (start === -1 || end === -1 || end <= start) return null;
   try {
     const arr = JSON.parse(clean.slice(start, end + 1));
     if (Array.isArray(arr) && arr.length > 0) return arr;
-    return null;
-  } catch (e) {
-    // Try to fix common JSON issues — trailing commas
+  } catch {
     try {
-      const fixed = clean.slice(start, end + 1)
-        .replace(/,\s*}/g, '}')
-        .replace(/,\s*]/g, ']');
+      const fixed = clean.slice(start, end + 1).replace(/,\s*}/g, '}').replace(/,\s*]/g, ']');
       const arr = JSON.parse(fixed);
       if (Array.isArray(arr) && arr.length > 0) return arr;
-    } catch (e2) { /* fall through */ }
-    return null;
+    } catch { }
   }
+  return null;
 }
-
-// ─── Process ──────────────────────────────────────────────────────────────────
 
 function clamp(v) { return Math.min(100, Math.max(0, Math.round(Number(v) || 0))); }
 
-function processProducts(raw) {
+function validUrl(u) {
+  if (!u || u === 'null' || u === 'undefined') return null;
+  try { new URL(u); return u; } catch { return null; }
+}
+
+function processProducts(raw, minPrice = 0) {
   return raw
-    .filter(p => p && p.name)
+    .filter(p => {
+      if (!p || !p.name) return false;
+      if (minPrice > 0) {
+        const match = String(p.retailPrice || '').match(/[\d.]+/);
+        const price = match ? parseFloat(match[0]) : null;
+        if (price === null || price < minPrice) return false;
+      }
+      return true;
+    })
     .map((p, i) => ({
       id: `p_${Date.now()}_${i}`,
       name: String(p.name).slice(0, 80),
@@ -165,46 +179,48 @@ function processProducts(raw) {
     .slice(0, 20);
 }
 
-function validUrl(u) {
-  if (!u || u === 'null' || u === 'undefined') return null;
-  try { new URL(u); return u; } catch { return null; }
-}
-
 // ─── Scan ─────────────────────────────────────────────────────────────────────
 
-async function runScan() {
-  console.log(`\n[${new Date().toISOString()}] Starting scan...`);
-  const raw = await researchProducts();
+async function runScan(minPrice = 0) {
+  console.log(`\n[${new Date().toISOString()}] Starting scan (minPrice: $${minPrice})...`);
+  currentMinPrice = minPrice;
+  const raw = await researchProducts(minPrice);
   if (raw.length > 0) {
-    products = processProducts(raw);
+    products = processProducts(raw, minPrice);
   } else {
     console.log('No products returned — keeping previous results');
   }
   lastScan = new Date().toISOString();
-  scanLog.unshift({ scannedAt: lastScan, count: products.length });
+  scanLog.unshift({ scannedAt: lastScan, count: products.length, minPrice });
   if (scanLog.length > 20) scanLog = scanLog.slice(0, 20);
   console.log(`Scan complete. ${products.length} products.`);
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
-app.get('/health', (req, res) => res.json({ status: 'ok', lastScan, productCount: products.length }));
+app.get('/health', (req, res) => res.json({ status: 'ok', lastScan, productCount: products.length, currentMinPrice }));
 
 app.get('/products', (req, res) => res.json({
-  products, lastScan,
+  products, lastScan, currentMinPrice,
   nextScan: lastScan ? new Date(new Date(lastScan).getTime() + 3*60*60*1000).toISOString() : null,
   scanLog,
 }));
 
+// Accept minPrice from frontend
 app.post('/scan', async (req, res) => {
-  res.json({ status: scanning ? 'already_scanning' : 'started' });
-  if (!scanning) { scanning = true; await runScan(); scanning = false; }
+  const minPrice = parseInt(req.body?.minPrice) || 0;
+  res.json({ status: scanning ? 'already_scanning' : 'started', minPrice });
+  if (!scanning) {
+    scanning = true;
+    await runScan(minPrice);
+    scanning = false;
+  }
 });
 
-// ─── Scheduler ────────────────────────────────────────────────────────────────
+// ─── Scheduler — use last known minPrice ──────────────────────────────────────
 
 cron.schedule('0 */3 * * *', async () => {
-  if (!scanning) { scanning = true; await runScan(); scanning = false; }
+  if (!scanning) { scanning = true; await runScan(currentMinPrice); scanning = false; }
 });
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────
@@ -212,6 +228,6 @@ cron.schedule('0 */3 * * *', async () => {
 app.listen(PORT, async () => {
   console.log(`Scout backend running on port ${PORT}`);
   scanning = true;
-  await runScan();
+  await runScan(0);
   scanning = false;
 });
