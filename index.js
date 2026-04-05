@@ -21,109 +21,101 @@ let scanning = false;
 async function researchProducts() {
   console.log('Running Claude product research with web search...');
 
-  const prompt = `You are a dropshipping product researcher. Use web search to find physical products that are trending RIGHT NOW and would be good candidates for a dropshipping business.
+  const prompt = `You are an expert dropshipping product researcher. Use web search extensively to find physical products trending RIGHT NOW that would be great dropshipping candidates.
 
-Search for:
-1. Products going viral on TikTok this week
-2. Amazon best sellers moving up in rankings this week  
-3. Products being talked about on Reddit in r/BuyItForLife, r/amazonfinds, r/shutupandtakemymoney this week
-4. Any other trending consumer products you find
+Search for ALL of the following:
+1. "tiktok trending products this week 2026"
+2. "amazon best sellers rising 2026"
+3. "reddit shutupandtakemymoney top posts this week"
+4. "reddit amazonfinds trending"
+5. "viral products to sell online 2026"
+6. Any specific products you find — search each one individually to get more detail
 
-For each product you identify, evaluate:
-- TikTok trend score (0-100): how viral is it on TikTok right now
-- Amazon score (0-100): how well is it selling on Amazon
-- Reddit score (0-100): how much organic buzz on Reddit
-- Margin score (0-100): estimated dropship margin potential (higher margin = better)
+For each product you identify, I need RICH details. Search for each product individually to find:
+- Real product links (Amazon listing URL, TikTok video URL, Reddit post URL — actual URLs you find)
+- Real image URLs from product pages or listings
+- Specific reasons why it is trending (viral video views, Amazon rank, Reddit upvotes etc)
+- Price range (what it sells for retail)
+- Estimated wholesale/supplier cost
+- Why it would make a good dropship product
 
-Return ONLY a JSON array with exactly this structure, no other text:
+Return ONLY a valid JSON array with this exact structure, no markdown, no explanation, just the array:
 [
   {
-    "name": "Product Name",
-    "category": "category",
-    "tiktok": 75,
-    "amazon": 68,
-    "reddit": 55,
-    "margin": 60,
+    "name": "Exact Product Name",
+    "category": "home decor / fitness / kitchen / gadgets / beauty / outdoor / pet / office",
+    "tiktok": 82,
+    "amazon": 74,
+    "reddit": 61,
+    "margin": 65,
     "signals": ["tiktok", "amazon"],
-    "summary": "2-3 sentence explanation of why this product is trending and worth considering",
-    "source": "tiktok"
+    "source": "tiktok",
+    "retailPrice": "$29.99",
+    "wholesaleEstimate": "$8-12",
+    "whyTrending": "Specific reason this is trending right now with real data points — views, rank, upvotes etc",
+    "whyDropship": "Why this is a good dropship product — margin, demand, competition level",
+    "tiktokUrl": "https://www.tiktok.com/... or null if not found",
+    "amazonUrl": "https://www.amazon.com/... or null if not found",
+    "redditUrl": "https://www.reddit.com/... or null if not found",
+    "imageUrl": "https://... real product image URL or null",
+    "searchQuery": "exact search term someone would use to find this product on AliExpress or Alibaba"
   }
 ]
 
 Rules:
-- Only physical products someone could buy wholesale and resell
-- No food, no regulated items, no branded/trademarked products
-- Aim for 10-15 products
-- signals array should only include sources where score >= 65
-- source field = where you found the strongest signal (tiktok/amazon/reddit)
-- Make scores realistic based on what you actually find, not made up`;
+- Only physical products — no food, no regulated items, no branded/trademarked products
+- Aim for 12-18 products
+- signals array only includes sources where score >= 65
+- ALL URLs must be real URLs you actually found during your searches — use null if you did not find one
+- imageUrl should be a direct image URL ending in .jpg .png .webp if possible
+- whyTrending must include specific data points (views counts, rank numbers, upvote counts)
+- Make scores realistic based on actual evidence you found`;
 
   try {
-    const response = await client.messages.create({
+    const messages = [{ role: 'user', content: prompt }];
+    let response = await client.messages.create({
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 4000,
+      max_tokens: 8000,
       tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-      messages: [{ role: 'user', content: prompt }],
+      messages,
     });
 
-    // Extract the final text response after web searches complete
-    let resultText = '';
-    for (const block of response.content) {
-      if (block.type === 'text') {
-        resultText += block.text;
-      }
-    }
-
-    // Handle multi-turn if web search was used
-    let finalText = resultText;
-    if (response.stop_reason === 'tool_use') {
-      // Continue conversation after tool use
-      const messages = [
-        { role: 'user', content: prompt },
-        { role: 'assistant', content: response.content },
-      ];
-
-      // Add tool results
+    // Agentic loop — keep going until Claude stops using tools
+    while (response.stop_reason === 'tool_use') {
       const toolResults = [];
       for (const block of response.content) {
         if (block.type === 'tool_use') {
+          console.log(`  Searching: ${block.input?.query || '...'}`);
           toolResults.push({
             type: 'tool_result',
             tool_use_id: block.id,
-            content: block.input?.query ? `Search completed for: ${block.input.query}` : 'Search completed',
+            content: 'Search executed successfully',
           });
         }
       }
-
-      if (toolResults.length > 0) {
-        messages.push({ role: 'user', content: toolResults });
-        const followUp = await client.messages.create({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 4000,
-          tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-          messages,
-        });
-        finalText = followUp.content
-          .filter(b => b.type === 'text')
-          .map(b => b.text)
-          .join('');
-      }
+      messages.push({ role: 'assistant', content: response.content });
+      messages.push({ role: 'user', content: toolResults });
+      response = await client.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 8000,
+        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+        messages,
+      });
     }
 
-    // Parse JSON from response
-    const clean = finalText
-      .replace(/```json/g, '')
-      .replace(/```/g, '')
-      .trim();
+    // Extract final text
+    const finalText = response.content
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('');
 
+    // Parse JSON
+    const clean = finalText.replace(/```json/g, '').replace(/```/g, '').trim();
     const startIdx = clean.indexOf('[');
     const endIdx = clean.lastIndexOf(']');
-    if (startIdx === -1 || endIdx === -1) throw new Error('No JSON array found in response');
-
-    const jsonStr = clean.slice(startIdx, endIdx + 1);
-    const parsed = JSON.parse(jsonStr);
-
-    console.log(`Claude found ${parsed.length} products`);
+    if (startIdx === -1 || endIdx === -1) throw new Error('No JSON array in response');
+    const parsed = JSON.parse(clean.slice(startIdx, endIdx + 1));
+    console.log(`Claude found ${parsed.length} products with rich data`);
     return parsed;
 
   } catch (err) {
@@ -132,28 +124,38 @@ Rules:
   }
 }
 
-// ─── Score and format ─────────────────────────────────────────────────────────
+// ─── Process and score ────────────────────────────────────────────────────────
 
 function processProducts(raw) {
   return raw
-    .filter(p => p.name && p.tiktok !== undefined)
+    .filter(p => p.name)
     .map((p, i) => ({
       id: `p_${Date.now()}_${i}`,
       name: p.name,
       category: p.category || 'general',
-      tiktok: Math.min(100, Math.max(0, Math.round(p.tiktok))),
-      amazon: Math.min(100, Math.max(0, Math.round(p.amazon))),
-      reddit: Math.min(100, Math.max(0, Math.round(p.reddit))),
-      margin: Math.min(100, Math.max(0, Math.round(p.margin))),
-      score: Math.round(p.tiktok * 0.40 + p.amazon * 0.30 + p.reddit * 0.15 + p.margin * 0.15),
+      tiktok: clamp(p.tiktok),
+      amazon: clamp(p.amazon),
+      reddit: clamp(p.reddit),
+      margin: clamp(p.margin),
+      score: Math.round(clamp(p.tiktok) * 0.40 + clamp(p.amazon) * 0.30 + clamp(p.reddit) * 0.15 + clamp(p.margin) * 0.15),
       signals: p.signals || [],
-      summary: p.summary || '',
       source: p.source || 'web',
+      retailPrice: p.retailPrice || null,
+      wholesaleEstimate: p.wholesaleEstimate || null,
+      whyTrending: p.whyTrending || '',
+      whyDropship: p.whyDropship || '',
+      tiktokUrl: p.tiktokUrl || null,
+      amazonUrl: p.amazonUrl || null,
+      redditUrl: p.redditUrl || null,
+      imageUrl: p.imageUrl || null,
+      searchQuery: p.searchQuery || p.name,
       scannedAt: new Date().toISOString(),
     }))
     .sort((a, b) => b.score - a.score)
     .slice(0, 20);
 }
+
+function clamp(v) { return Math.min(100, Math.max(0, Math.round(Number(v) || 0))); }
 
 // ─── Main scan ────────────────────────────────────────────────────────────────
 
@@ -174,26 +176,15 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/products', (req, res) => {
-  res.json({
-    products,
-    lastScan,
-    nextScan: lastScan
-      ? new Date(new Date(lastScan).getTime() + 3 * 60 * 60 * 1000).toISOString()
-      : null,
-    scanLog,
-  });
+  res.json({ products, lastScan, nextScan: lastScan ? new Date(new Date(lastScan).getTime() + 3 * 60 * 60 * 1000).toISOString() : null, scanLog });
 });
 
 app.post('/scan', async (req, res) => {
   res.json({ status: scanning ? 'already_scanning' : 'started' });
-  if (!scanning) {
-    scanning = true;
-    await runScan();
-    scanning = false;
-  }
+  if (!scanning) { scanning = true; await runScan(); scanning = false; }
 });
 
-// ─── Scheduler — every 3 hours ────────────────────────────────────────────────
+// ─── Scheduler ────────────────────────────────────────────────────────────────
 
 cron.schedule('0 */3 * * *', async () => {
   if (!scanning) { scanning = true; await runScan(); scanning = false; }
