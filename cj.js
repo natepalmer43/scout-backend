@@ -1,4 +1,6 @@
 const axios = require('axios');
+const Anthropic = require('@anthropic-ai/sdk');
+const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const CJ_BASE = 'https://developers.cjdropshipping.com/api2.0/v1';
 
@@ -64,29 +66,53 @@ async function searchProduct(productName, token) {
     }
 
     const items = res.data.data.list;
-    const best = items[0];
-
-    return {
-      cjProductId: best.pid,
-      cjProductName: best.productName,
-      cjPrice: best.sellPrice,
-      cjShippingTime: best.deliveryTime || null,
-      cjImageUrl: best.productImage || null,
-      cjProductUrl: 'https://cjdropshipping.com/product/' + best.pid + '.html',
-      cjMatchScore: calcMatchScore(productName, best.productName),
-      allMatches: items.slice(0, 3).map(function(item) {
-        return {
-          id: item.pid,
-          name: item.productName,
-          price: item.sellPrice,
-          image: item.productImage,
-          url: 'https://cjdropshipping.com/product/' + item.pid + '.html',
-        };
-      }),
-    };
+    // Return all candidates for Claude to evaluate
+    return items.slice(0, 5).map(function(item) {
+      return {
+        id: item.pid,
+        name: item.productName,
+        price: item.sellPrice,
+        image: item.productImage,
+        url: 'https://cjdropshipping.com/product/' + item.pid + '.html',
+        shippingTime: item.deliveryTime || null,
+      };
+    });
   } catch (err) {
     console.error('CJ search error for "' + productName + '":', (err.response && err.response.data && err.response.data.message) || err.message);
     return null;
+  }
+}
+
+
+async function claudePickBestMatch(targetProduct, cjCandidates) {
+  if (!cjCandidates || !cjCandidates.length) return null;
+  if (cjCandidates.length === 1) return cjCandidates[0];
+
+  try {
+    var candidateList = cjCandidates.map(function(c, i) {
+      return (i+1) + '. "' + c.name + '" @ $' + c.price;
+    }).join('\n');
+
+    var response = await claude.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 100,
+      messages: [{
+        role: 'user',
+        content: 'I am looking for a dropshipping supplier match for: "' + targetProduct + '"\n\nCJ Dropshipping has these options:\n' + candidateList + '\n\nWhich number is the best match? If none are a reasonable match for the same type of product, say "none". Reply with just the number or "none".'
+      }]
+    });
+
+    var answer = response.content[0].text.trim().toLowerCase();
+    if (answer === 'none') return null;
+    var num = parseInt(answer);
+    if (!isNaN(num) && num >= 1 && num <= cjCandidates.length) {
+      console.log('  Claude picked match #' + num + ': "' + cjCandidates[num-1].name + '"');
+      return cjCandidates[num-1];
+    }
+    return cjCandidates[0];
+  } catch(err) {
+    console.error('Claude match error:', err.message);
+    return cjCandidates[0];
   }
 }
 
@@ -102,34 +128,41 @@ async function searchAllProducts(products) {
   for (var i = 0; i < products.length; i++) {
     var p = products[i];
     // Try searchQuery first (AliExpress term Claude generated), then fall back to product name
-    var cj = await searchProduct(p.searchQuery || p.name, token);
-    // If no match or low confidence, try again with just the product name
-    if (!cj || cj.cjMatchScore < 30) {
-      var cj2 = await searchProduct(p.name, token);
+    // Get CJ candidates
+    var candidates = await searchProduct(p.searchQuery || p.name, token);
+    await sleep(1200);
+
+    // If no results with searchQuery, try product name
+    if (!candidates || !candidates.length) {
+      candidates = await searchProduct(p.name, token);
       await sleep(1200);
-      if (cj2 && (!cj || cj2.cjMatchScore > cj.cjMatchScore)) {
-        cj = cj2;
-      }
     }
 
-    if (cj) {
-      console.log('  CJ match: "' + p.name + '" -> "' + cj.cjProductName + '" (' + cj.cjMatchScore + '% match) @ $' + cj.cjPrice);
+    // Have Claude pick the best match from candidates
+    var best = null;
+    if (candidates && candidates.length) {
+      best = await claudePickBestMatch(p.name, candidates);
+      await sleep(500); // small delay after Claude call
+    }
+
+    if (best) {
+      console.log('  Matched: "' + p.name + '" -> "' + best.name + '" @ $' + best.price);
       results.push(Object.assign({}, p, {
         cj: {
           found: true,
-          matchScore: cj.cjMatchScore,
-          productId: cj.cjProductId,
-          productName: cj.cjProductName,
-          price: cj.cjPrice,
-          shippingTime: cj.cjShippingTime,
-          imageUrl: cj.cjImageUrl,
-          productUrl: cj.cjProductUrl,
-          allMatches: cj.allMatches,
+          productId: best.id,
+          productName: best.name,
+          price: best.price,
+          shippingTime: best.shippingTime,
+          imageUrl: best.image,
+          productUrl: best.url,
+          allMatches: candidates.slice(0, 3),
         },
-        wholesaleEstimate: cj.cjPrice ? '$' + cj.cjPrice + ' (CJ live)' : p.wholesaleEstimate,
-        imageUrl: p.imageUrl || cj.cjImageUrl || null,
+        wholesaleEstimate: best.price ? '$' + best.price + ' (CJ live)' : p.wholesaleEstimate,
+        imageUrl: p.imageUrl || best.image || null,
       }));
     } else {
+      console.log('  No CJ match found for: "' + p.name + '"');
       results.push(Object.assign({}, p, { cj: { found: false } }));
     }
 
