@@ -17,15 +17,12 @@ async function getToken() {
   const CJ_API_KEY = process.env.CJ_API_KEY;
   if (!CJ_API_KEY) { console.error('No CJ_API_KEY set'); return null; }
 
-  // Extract key portion after @api@ if present
-  const keyPart = CJ_API_KEY.includes('@api@')
-    ? CJ_API_KEY.split('@api@')[1]
     : CJ_API_KEY;
 
   try {
     const res = await axios.post(
       `${CJ_BASE}/authentication/getAccessToken`,
-      { apiKey: keyPart },
+      { apiKey: CJ_API_KEY },
       { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
     );
 
