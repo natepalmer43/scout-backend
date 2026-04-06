@@ -75,8 +75,10 @@ async function fetchCategoryProducts(token, categoryId, categoryName, pageSize) 
         categoryId: categoryId,
         pageNum: 1,
         pageSize: pageSize,
-        sortField: 'orderCount',  // sort by most ordered = proven sellers
+        sortField: 'orderCount',
         sortType: 'DESC',
+        listingStatus: 1,       // 1 = listed/active only
+        countryCode: 'US',      // US warehouse products
       },
       timeout: 20000,
     });
@@ -89,18 +91,30 @@ async function fetchCategoryProducts(token, categoryId, categoryName, pageSize) 
     const items = res.data.data.list;
     console.log('  ' + categoryName + ': ' + items.length + ' products fetched');
 
-    return items.map(function(item) {
-      return {
-        cjProductId: item.pid,
-        name: item.productName,
-        category: categoryName,
-        price: item.sellPrice,
-        imageUrl: item.productImage || null,
-        productUrl: 'https://cjdropshipping.com/product/' + item.pid + '.html',
-        shippingTime: item.deliveryTime || null,
-        weight: item.productWeight || null,
-      };
-    });
+    var mapped = items
+      .filter(function(item) {
+        // Skip products with Chinese characters in name
+        var name = item.productName || '';
+        if (/[一-鿿]/.test(name)) return false;
+        // Skip if no price
+        if (!item.sellPrice || parseFloat(item.sellPrice) <= 0) return false;
+        // Skip very cheap items (likely junk)
+        if (parseFloat(item.sellPrice) < 2) return false;
+        return true;
+      })
+      .map(function(item) {
+        return {
+          cjProductId: item.pid,
+          name: item.productName,
+          category: categoryName,
+          price: parseFloat(item.sellPrice),
+          imageUrl: item.productImage || null,
+          productUrl: 'https://cjdropshipping.com/product/' + item.pid + '.html',
+          shippingTime: item.deliveryTime || null,
+        };
+      });
+    console.log('  ' + categoryName + ': ' + items.length + ' fetched, ' + mapped.length + ' after filtering');
+    return mapped;
   } catch (err) {
     console.error('CJ category fetch error (' + categoryName + '):', (err.response && err.response.data && err.response.data.message) || err.message);
     return [];
@@ -146,7 +160,7 @@ async function scoreBatch(products) {
     return (i + 1) + '. "' + p.name + '" - $' + p.price + ' (' + p.category + ')';
   }).join('\n');
 
-  var prompt = 'Score these ' + products.length + ' dropshipping products for trend potential. Search the web for each.\n\nProducts:\n' + productList + '\n\nReturn ONLY JSON array:\n[{"index":1,"tiktok":72,"amazon":68,"reddit":45,"margin":70,"whyTrending":"reason","whyDropship":"reason","tiktokUrl":null,"amazonUrl":null,"redditUrl":null}]\n\nAll ' + products.length + ' products. Honest scores 0-100.';
+  var prompt = 'Score these ' + products.length + ' dropshipping products. Search Amazon and Google Shopping for each to find real retail prices and demand signals.\n\nProducts (with wholesale cost from CJ):\n' + productList + '\n\nFor each product find: (1) what it sells for on Amazon/retail, (2) social media demand signals.\n\nReturn ONLY JSON array, no other text:\n[{"index":1,"tiktok":72,"amazon":68,"reddit":45,"margin":70,"retailPrice":"$29.99","whyTrending":"specific data points","whyDropship":"margin and demand reason","tiktokUrl":null,"amazonUrl":"https://amazon.com/s?k=product","redditUrl":null}]\n\nAll ' + products.length + ' products. retailPrice = what it sells for retail. Honest scores.';
 
   try {
     var messages = [{ role: 'user', content: prompt }];
@@ -267,6 +281,14 @@ async function fetchAndScoreCJProducts(minPrice) {
       if (reddit >= 65) signals.push('reddit');
       if (margin >= 65) signals.push('margin');
 
+      // Calculate margin if we have both retail and wholesale prices
+      var retailPrice = s.retailPrice || null;
+      var wholesale = cjProduct.price || 0;
+      var retailNum = retailPrice ? parseFloat(retailPrice.replace(/[^0-9.]/g, '')) : 0;
+      var marginPct = (retailNum > 0 && wholesale > 0)
+        ? Math.round(((retailNum - wholesale) / retailNum) * 100)
+        : null;
+
       allScored.push({
         id: 'cj_' + cjProduct.cjProductId,
         name: cjProduct.name,
@@ -278,8 +300,9 @@ async function fetchAndScoreCJProducts(minPrice) {
         score: overall,
         signals: signals,
         source: 'cj',
-        retailPrice: null,  // Claude will estimate or leave blank
+        retailPrice: retailPrice,
         wholesaleEstimate: cjProduct.price ? '$' + cjProduct.price + ' (CJ)' : null,
+        marginPct: marginPct,
         whyTrending: s.whyTrending || '',
         whyDropship: s.whyDropship || '',
         tiktokUrl: validUrl(s.tiktokUrl),
