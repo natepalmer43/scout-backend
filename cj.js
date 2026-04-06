@@ -9,6 +9,15 @@ let tokenExpiry = null;
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+function slugify(name) {
+  return (name || '').toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 120);
+}
+
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 
 async function getToken() {
@@ -146,7 +155,7 @@ async function fetchCategoryProducts(token, categoryId, categoryName, pageSize) 
           category: categoryName,
           price: parseFloat(item.sellPrice),
           imageUrl: item.productImage || null,
-          productUrl: 'https://cjdropshipping.com/product/' + item.pid + '.html',
+          productUrl: 'https://cjdropshipping.com/product/' + slugify(item.productName) + '-p-' + item.pid + '.html',
           shippingTime: item.deliveryTime || null,
         };
       });
@@ -217,7 +226,7 @@ async function fetchAllCJProducts(minPrice) {
             category: cat.name,
             price: parseFloat(item.sellPrice),
             imageUrl: item.bigImage || null,
-            productUrl: 'https://cjdropshipping.com/product/' + item.id + '.html',
+            productUrl: 'https://cjdropshipping.com/product/' + slugify(item.nameEn) + '-p-' + item.id + '.html',
             shippingTime: item.deliveryCycle || null,
           };
         });
