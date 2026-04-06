@@ -165,7 +165,7 @@ async function fetchAllCJProducts(minPrice) {
   if (!token) return [];
 
   const PAGE_SIZE = 20;
-  const TARGET_PER_CATEGORY = 10;
+  const TARGET_PER_CATEGORY = 15;
   const allProducts = [];
 
   for (var i = 0; i < TARGET_CATEGORIES.length; i++) {
@@ -257,10 +257,9 @@ async function scoreBatch(products, attempt) {
 
   try {
     var response = await claude.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+      model: 'claude-sonnet-4-20250514',
       max_tokens: 2000,
       messages: [{ role: 'user', content: prompt }],
-    });
 
     var finalText = response.content
       .filter(function(b) { return b.type === 'text'; })
@@ -272,7 +271,7 @@ async function scoreBatch(products, attempt) {
 
     // Retry once asking for clean JSON
     var retry = await claude.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+      model: 'claude-sonnet-4-20250514',
       max_tokens: 2000,
       messages: [
         { role: 'user', content: prompt },
@@ -333,6 +332,17 @@ async function fetchAndScoreCJProducts(minPrice) {
   if (!cjProducts.length) {
     console.log('No CJ products fetched');
     return [];
+  }
+
+  // Step 1.5: Verify products actually have inventory before scoring
+  var token = await getToken();
+  if (token) {
+    console.log('Verifying inventory for ' + cjProducts.length + ' products...');
+    cjProducts = await verifyProductsBatch(cjProducts, token);
+    if (!cjProducts.length) {
+      console.log('No products passed inventory verification');
+      return [];
+    }
   }
 
   // Step 2: Score in batches of 10 to stay within rate limits
