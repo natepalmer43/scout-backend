@@ -46,8 +46,8 @@ async function getToken() {
   }
 }
 
-async function verifyProduct(p, token) {
-  if (!p.cjProductId) return true;
+async function verifyAndEnrichProduct(p, token) {
+  if (!p.cjProductId) return p;
 
   try {
     var res = await axios.get(CJ_BASE + '/product/query', {
@@ -57,32 +57,98 @@ async function verifyProduct(p, token) {
     });
 
     // No data = product removed
-    if (!res.data || !res.data.result || !res.data.data) return false;
+    if (!res.data || !res.data.result || !res.data.data) return null;
 
     // status=3 means removed/delisted on CJ
-    if (res.data.data.status === 3 || res.data.data.status === '3') return false;
+    var data = res.data.data;
+    if (data.status === 3 || data.status === '3') return null;
 
-    return true;
+    // Grab first variant ID for freight calculation
+    if (data.variants && data.variants.length > 0) {
+      p.variantId = data.variants[0].vid;
+    }
+
+    return p;
   } catch (err) {
-    // If endpoint errors, assume active to avoid over-filtering
-    return true;
+    // If endpoint errors, assume active
+    return p;
   }
 }
 
-async function verifyProductsBatch(products, token) {
+async function getShippingCost(token, variantId) {
+  if (!variantId) return null;
+
+  try {
+    var res = await axios.post(CJ_BASE + '/logistic/freightCalculate', {
+      startCountryCode: 'CN',
+      endCountryCode: 'US',
+      products: [{ quantity: 1, vid: variantId }],
+    }, {
+      headers: {
+        'CJ-Access-Token': token,
+        'Content-Type': 'application/json',
+      },
+      timeout: 10000,
+    });
+
+    if (!res.data || !res.data.result || !res.data.data || !res.data.data.length) return null;
+
+    // Find cheapest shipping option
+    var options = res.data.data;
+    var cheapest = null;
+    for (var i = 0; i < options.length; i++) {
+      var price = parseFloat(options[i].logisticPrice);
+      if (!isNaN(price) && price > 0) {
+        if (cheapest === null || price < cheapest.price) {
+          cheapest = {
+            price: price,
+            name: options[i].logisticName || 'Standard',
+            days: options[i].logisticAging || null,
+          };
+        }
+      }
+    }
+    return cheapest;
+  } catch (err) {
+    return null;
+  }
+}
+
+async function verifyAndEnrichBatch(products, token) {
   var verified = [];
   var removed = 0;
+  var shippingFound = 0;
+
   for (var i = 0; i < products.length; i++) {
-    var p = products[i];
-    var exists = await verifyProduct(p, token);
-    if (exists) {
-      verified.push(p);
-    } else {
+    var p = await verifyAndEnrichProduct(products[i], token);
+    if (!p) {
       removed++;
+      await sleep(800);
+      continue;
     }
+
+    // Get shipping cost if we have a variant ID
+    if (p.variantId) {
+      var shipping = await getShippingCost(token, p.variantId);
+      if (shipping) {
+        p.shippingCost = shipping.price;
+        p.shippingMethod = shipping.name;
+        p.shippingDays = shipping.days;
+        p.landedCost = Math.round((p.price + shipping.price) * 100) / 100;
+        shippingFound++;
+      } else {
+        p.landedCost = p.price;
+      }
+      await sleep(600);
+    } else {
+      p.landedCost = p.price;
+    }
+
+    verified.push(p);
     await sleep(800);
   }
-  console.log('Verification: ' + verified.length + ' active, ' + removed + ' removed (of ' + products.length + ' checked)');
+
+  console.log('Verification: ' + verified.length + ' active, ' + removed + ' removed, ' + shippingFound + ' with shipping costs');
   return verified;
 }
 
@@ -263,12 +329,14 @@ async function scoreBatch(products, attempt) {
   if (attempt > 4) { console.error('Max retries hit for batch'); return []; }
 
   var productList = products.map(function(p, i) {
-    return (i + 1) + '. "' + p.name + '" - CJ wholesale: $' + p.price + ' (' + p.category + ')';
+    var costStr = '$' + p.price;
+    if (p.shippingCost) costStr += ' + $' + p.shippingCost + ' shipping = $' + p.landedCost + ' landed';
+    return (i + 1) + '. "' + p.name + '" - CJ cost: ' + costStr + ' (' + p.category + ')';
   }).join('\n');
 
   // No web search — Claude scores from training knowledge
   // This is fast, cheap, and never hits rate limits
-  var prompt = 'You are a dropshipping expert. Score these ' + products.length + ' products for dropshipping potential based on your knowledge of consumer trends, social media popularity, and market demand.\n\nProducts (with CJ wholesale cost):\n' + productList + '\n\nFor each product estimate:\n- tiktok: TikTok/social media trend score (0-100)\n- amazon: Amazon demand score (0-100)\n- reddit: Organic community buzz (0-100)\n- margin: Profit margin potential (0-100, based on typical retail price vs wholesale cost shown)\n- retailPrice: What this typically sells for retail (e.g. "$29.99")\n- whyTrending: 1 sentence on why consumers want this\n- whyDropship: 1 sentence on dropship viability\n- amazonUrl: Amazon search URL for this product\n\nReturn ONLY a JSON array, no other text:\n[{"index":1,"tiktok":75,"amazon":68,"reddit":45,"margin":72,"retailPrice":"$34.99","whyTrending":"reason","whyDropship":"reason","amazonUrl":"https://amazon.com/s?k=product+name","tiktokUrl":null,"redditUrl":null}]\n\nAll ' + products.length + ' products required.';
+  var prompt = 'You are a dropshipping expert. Score these ' + products.length + ' products for dropshipping potential based on your knowledge of consumer trends, social media popularity, and market demand.\n\nProducts (with CJ landed cost including shipping to US):\n' + productList + '\n\nFor each product estimate:\n- tiktok: TikTok/social media trend score (0-100)\n- amazon: Amazon demand score (0-100)\n- reddit: Organic community buzz (0-100)\n- margin: Profit margin potential (0-100, based on typical retail price vs the landed cost shown)\n- retailPrice: What this typically sells for retail (e.g. "$29.99")\n- whyTrending: 1 sentence on why consumers want this\n- whyDropship: 1 sentence on dropship viability\n- amazonUrl: Amazon search URL for this product\n\nReturn ONLY a JSON array, no other text:\n[{"index":1,"tiktok":75,"amazon":68,"reddit":45,"margin":72,"retailPrice":"$34.99","whyTrending":"reason","whyDropship":"reason","amazonUrl":"https://amazon.com/s?k=product+name","tiktokUrl":null,"redditUrl":null}]\n\nAll ' + products.length + ' products required.';
 
   try {
     var response = await claude.messages.create({
@@ -350,13 +418,13 @@ async function fetchAndScoreCJProducts(minPrice) {
     return [];
   }
 
-  // Step 1.5: Verify products actually have inventory before scoring
+  // Step 1.5: Verify products and get shipping costs
   var token = await getToken();
   if (token) {
-    console.log('Verifying inventory for ' + cjProducts.length + ' products...');
-    cjProducts = await verifyProductsBatch(cjProducts, token);
+    console.log('Verifying & enriching ' + cjProducts.length + ' products (status + shipping)...');
+    cjProducts = await verifyAndEnrichBatch(cjProducts, token);
     if (!cjProducts.length) {
-      console.log('No products passed inventory verification');
+      console.log('No products passed verification');
       return [];
     }
   }
@@ -388,12 +456,12 @@ async function fetchAndScoreCJProducts(minPrice) {
       if (reddit >= 65) signals.push('reddit');
       if (margin >= 65) signals.push('margin');
 
-      // Calculate margin if we have both retail and wholesale prices
+      // Calculate margin using landed cost (product + shipping) vs retail
       var retailPrice = s.retailPrice || null;
-      var wholesale = cjProduct.price || 0;
+      var landedCost = cjProduct.landedCost || cjProduct.price || 0;
       var retailNum = retailPrice ? parseFloat(retailPrice.replace(/[^0-9.]/g, '')) : 0;
-      var marginPct = (retailNum > 0 && wholesale > 0)
-        ? Math.round(((retailNum - wholesale) / retailNum) * 100)
+      var marginPct = (retailNum > 0 && landedCost > 0)
+        ? Math.round(((retailNum - landedCost) / retailNum) * 100)
         : null;
 
       allScored.push({
@@ -409,6 +477,9 @@ async function fetchAndScoreCJProducts(minPrice) {
         source: 'cj',
         retailPrice: retailPrice,
         wholesaleEstimate: cjProduct.price ? '$' + cjProduct.price + ' (CJ)' : null,
+        shippingCost: cjProduct.shippingCost ? '$' + cjProduct.shippingCost : null,
+        shippingMethod: cjProduct.shippingMethod || null,
+        landedCost: landedCost ? '$' + landedCost : null,
         marginPct: marginPct,
         whyTrending: s.whyTrending || '',
         whyDropship: s.whyDropship || '',
@@ -422,7 +493,10 @@ async function fetchAndScoreCJProducts(minPrice) {
           productId: cjProduct.cjProductId,
           productName: cjProduct.name,
           price: cjProduct.price,
-          shippingTime: cjProduct.shippingTime,
+          shippingCost: cjProduct.shippingCost || null,
+          landedCost: landedCost,
+          shippingTime: cjProduct.shippingDays || cjProduct.shippingTime,
+          shippingMethod: cjProduct.shippingMethod || null,
           imageUrl: cjProduct.imageUrl,
           productUrl: cjProduct.productUrl,
           allMatches: [],
