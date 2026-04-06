@@ -2,7 +2,7 @@ const express = require('express');
 const cron = require('node-cron');
 const cors = require('cors');
 const Anthropic = require('@anthropic-ai/sdk');
-const { searchProduct } = require('./cj');
+const { searchAllProducts } = require('./cj');
 require('dotenv').config();
 
 const app = express();
@@ -143,44 +143,8 @@ async function enrichWithCJ(products) {
     console.log('No CJ_API_KEY — skipping supplier matching');
     return products;
   }
-
-  console.log(`Matching ${products.length} products against CJ catalog...`);
-
-  const enriched = await Promise.all(products.map(async (p) => {
-    try {
-      const cj = await searchProduct(p.searchQuery || p.name);
-      if (!cj) return p;
-
-      console.log(`  CJ match for "${p.name}": "${cj.cjProductName}" (${cj.cjMatchScore}% match) @ $${cj.cjPrice}`);
-
-      return {
-        ...p,
-        cj: {
-          found: true,
-          matchScore: cj.cjMatchScore,
-          productId: cj.cjProductId,
-          productName: cj.cjProductName,
-          price: cj.cjPrice,
-          currency: cj.cjCurrency,
-          shippingTime: cj.cjShippingTime,
-          imageUrl: cj.cjImageUrl,
-          productUrl: cj.cjProductUrl,
-          allMatches: cj.allMatches,
-        },
-        // Override wholesale estimate with real CJ price
-        wholesaleEstimate: cj.cjPrice ? `$${cj.cjPrice} (CJ)` : p.wholesaleEstimate,
-        // Use CJ image if we don't have one
-        imageUrl: p.imageUrl || cj.cjImageUrl || null,
-      };
-    } catch (err) {
-      console.error(`CJ enrichment error for ${p.name}:`, err.message);
-      return p;
-    }
-  }));
-
-  const matched = enriched.filter(p => p.cj?.found).length;
-  console.log(`CJ matching complete: ${matched}/${products.length} products matched`);
-  return enriched;
+  console.log(`Matching ${products.length} products against CJ catalog (sequential, 1.2s delay)...`);
+  return await searchAllProducts(products);
 }
 
 // ─── Process ──────────────────────────────────────────────────────────────────

@@ -1,26 +1,28 @@
 const axios = require('axios');
 
 const CJ_BASE = 'https://developers.cjdropshipping.com/api2.0/v1';
-const CJ_API_KEY = process.env.CJ_API_KEY;
 
 let accessToken = null;
 let tokenExpiry = null;
 
-// ─── Auth ─────────────────────────────────────────────────────────────────────
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ─── Auth — call once, reuse token ───────────────────────────────────────────
 
 async function getToken() {
   if (accessToken && tokenExpiry && new Date() < new Date(tokenExpiry)) {
     return accessToken;
   }
+
+  const CJ_API_KEY = process.env.CJ_API_KEY;
   if (!CJ_API_KEY) { console.error('No CJ_API_KEY set'); return null; }
 
-  try {
-    // CJ key format: CJ5301941@api@94d6a6cc0a6848b8a32e2f718058892b
-    // Extract the actual API key portion after the last @
-    const keyPart = CJ_API_KEY.includes('@api@')
-      ? CJ_API_KEY.split('@api@')[1]
-      : CJ_API_KEY;
+  // Extract key portion after @api@ if present
+  const keyPart = CJ_API_KEY.includes('@api@')
+    ? CJ_API_KEY.split('@api@')[1]
+    : CJ_API_KEY;
 
+  try {
     const res = await axios.post(
       `${CJ_BASE}/authentication/getAccessToken`,
       { apiKey: keyPart },
@@ -30,20 +32,7 @@ async function getToken() {
     if (res.data?.result && res.data?.data?.accessToken) {
       accessToken = res.data.data.accessToken;
       tokenExpiry = res.data.data.accessTokenExpiryDate;
-      console.log('CJ authenticated successfully');
-      return accessToken;
-    }
-
-    // Try with full key if extract didn't work
-    const res2 = await axios.post(
-      `${CJ_BASE}/authentication/getAccessToken`,
-      { apiKey: CJ_API_KEY },
-      { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
-    );
-    if (res2.data?.result && res2.data?.data?.accessToken) {
-      accessToken = res2.data.data.accessToken;
-      tokenExpiry = res2.data.data.accessTokenExpiryDate;
-      console.log('CJ authenticated with full key');
+      console.log('CJ authenticated successfully, token expires:', tokenExpiry);
       return accessToken;
     }
 
@@ -55,7 +44,7 @@ async function getToken() {
   }
 }
 
-// ─── Product search ───────────────────────────────────────────────────────────
+// ─── Search single product — with retry on rate limit ────────────────────────
 
 async function searchProduct(productName) {
   const token = await getToken();
@@ -80,7 +69,6 @@ async function searchProduct(productName) {
       cjProductId: best.pid,
       cjProductName: best.productName,
       cjPrice: best.sellPrice,
-      cjCategoryName: best.categoryName,
       cjShippingTime: best.deliveryTime || null,
       cjImageUrl: best.productImage || null,
       cjProductUrl: `https://cjdropshipping.com/product/${best.pid}.html`,
@@ -99,6 +87,52 @@ async function searchProduct(productName) {
   }
 }
 
+// ─── Search all products sequentially with 1.2s delay between calls ──────────
+
+async function searchAllProducts(products) {
+  // Authenticate once before starting
+  const token = await getToken();
+  if (!token) {
+    console.log('CJ auth failed — skipping supplier matching');
+    return products;
+  }
+
+  const results = [];
+
+  for (const product of products) {
+    const cj = await searchProduct(product.searchQuery || product.name);
+
+    if (cj) {
+      console.log(`  CJ match: "${product.name}" → "${cj.cjProductName}" (${cj.cjMatchScore}% match) @ $${cj.cjPrice}`);
+      results.push({
+        ...product,
+        cj: {
+          found: true,
+          matchScore: cj.cjMatchScore,
+          productId: cj.cjProductId,
+          productName: cj.cjProductName,
+          price: cj.cjPrice,
+          shippingTime: cj.cjShippingTime,
+          imageUrl: cj.cjImageUrl,
+          productUrl: cj.cjProductUrl,
+          allMatches: cj.allMatches,
+        },
+        wholesaleEstimate: cj.cjPrice ? `$${cj.cjPrice} (CJ live)` : product.wholesaleEstimate,
+        imageUrl: product.imageUrl || cj.cjImageUrl || null,
+      });
+    } else {
+      results.push({ ...product, cj: { found: false } });
+    }
+
+    // 1.2 second delay between calls to stay within QPS limit
+    await sleep(1200);
+  }
+
+  const matched = results.filter(p => p.cj?.found).length;
+  console.log(`CJ matching complete: ${matched}/${products.length} matched`);
+  return results;
+}
+
 function calcMatchScore(query, result) {
   const q = (query || '').toLowerCase().split(' ').filter(w => w.length > 2);
   const r = (result || '').toLowerCase();
@@ -106,4 +140,4 @@ function calcMatchScore(query, result) {
   return Math.round((matches / Math.max(q.length, 1)) * 100);
 }
 
-module.exports = { searchProduct, getToken };
+module.exports = { searchAllProducts, getToken };
