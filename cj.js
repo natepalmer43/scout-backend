@@ -41,65 +41,39 @@ async function verifyProduct(p, token) {
   if (!p.cjProductId) return true;
 
   try {
-    // Use product/query to get full product details — check if product is still active
     var res = await axios.get(CJ_BASE + '/product/query', {
       headers: { 'CJ-Access-Token': token },
       params: { pid: p.cjProductId },
       timeout: 10000,
     });
 
-    // Log first 5 products so we can see what CJ returns for live vs dead products
-    if (!verifyProduct._logCount) verifyProduct._logCount = 0;
-    if (verifyProduct._logCount < 5) {
-      var d = res.data && res.data.data;
-      console.log('  [verify debug] ' + (p.name || '').slice(0, 50) + ' | result=' + (res.data && res.data.result) + ' | hasData=' + !!d + ' | status=' + (d && d.status) + ' | productType=' + (d && d.productType) + ' | sellPrice=' + (d && d.sellPrice));
-      verifyProduct._logCount++;
-    }
+    // No data = product removed
+    if (!res.data || !res.data.result || !res.data.data) return false;
 
-    // If API says result=false or data is null, product is removed
-    if (!res.data || !res.data.result || !res.data.data) {
-      console.log('  REMOVED (no data): ' + (p.name || '').slice(0, 60));
-      return false;
-    }
-
-    var data = res.data.data;
-
-    // Check for status field — if CJ uses one
-    if (data.status !== undefined && data.status !== null) {
-      // Log any non-standard status values
-      if (data.status !== 'ACTIVE' && data.status !== 1 && data.status !== '1') {
-        console.log('  REMOVED (status=' + data.status + '): ' + (p.name || '').slice(0, 60));
-        return false;
-      }
-    }
-
-    // If sellPrice is 0 or missing, product is likely dead
-    if (!data.sellPrice || parseFloat(data.sellPrice) <= 0) {
-      console.log('  REMOVED (no price): ' + (p.name || '').slice(0, 60));
-      return false;
-    }
+    // status=3 means removed/delisted on CJ
+    if (res.data.data.status === 3 || res.data.data.status === '3') return false;
 
     return true;
   } catch (err) {
     // If endpoint errors, assume active to avoid over-filtering
-    console.log('  [verify error] ' + (p.name || '').slice(0, 50) + ': ' + (err.message || ''));
     return true;
   }
 }
 
 async function verifyProductsBatch(products, token) {
   var verified = [];
+  var removed = 0;
   for (var i = 0; i < products.length; i++) {
     var p = products[i];
     var exists = await verifyProduct(p, token);
     if (exists) {
       verified.push(p);
     } else {
-      console.log('  Out of stock/removed: ' + p.name);
+      removed++;
     }
-    await sleep(1200);
+    await sleep(800);
   }
-  console.log('Verified ' + verified.length + '/' + products.length + ' products have inventory');
+  console.log('Verification: ' + verified.length + ' active, ' + removed + ' removed (of ' + products.length + ' checked)');
   return verified;
 }
 
@@ -184,19 +158,19 @@ async function fetchCategoryProducts(token, categoryId, categoryName, pageSize) 
   }
 }
 
-// ─── Pull all target categories ───────────────────────────────────────────────
+// ─── Pull all target categories using V2 endpoint ────────────────────────────
 
 async function fetchAllCJProducts(minPrice) {
   const token = await getToken();
   if (!token) return [];
 
-  const PAGE_SIZE = 20;
+  const PAGE_SIZE = 50;
   const TARGET_PER_CATEGORY = 15;
   const allProducts = [];
 
   for (var i = 0; i < TARGET_CATEGORIES.length; i++) {
     var cat = TARGET_CATEGORIES[i];
-    console.log('Fetching category: ' + cat.name);
+    console.log('Fetching category: ' + cat.name + ' (V2)');
     var categoryProducts = [];
     var page = 1;
 
@@ -204,64 +178,70 @@ async function fetchAllCJProducts(minPrice) {
       try {
         var params = {
           categoryId: cat.id,
-          pageNum: page,
-          pageSize: PAGE_SIZE,
-          sortField: 'orderCount',
-          sortType: 'DESC',
-          startInventory: 1,  // ONLY products with inventory >= 1
-          verifiedWarehouse: 1, // ONLY verified inventory
+          page: page,
+          size: PAGE_SIZE,
+          orderBy: 1,              // sort by listing count (popularity)
+          sort: 'desc',
+          startWarehouseInventory: 1,  // only products with inventory >= 1
+          verifiedWarehouse: 1,        // verified inventory only
         };
-        if (minPrice > 0) params.minPrice = minPrice;
+        if (minPrice > 0) params.startSellPrice = minPrice;
 
-        var res = await axios.get(CJ_BASE + '/product/list', {
+        var res = await axios.get(CJ_BASE + '/product/listV2', {
           headers: { 'CJ-Access-Token': token },
           params: params,
           timeout: 20000,
         });
 
-        if (!res.data || !res.data.result || !res.data.data || !res.data.data.list) break;
-        var items = res.data.data.list;
+        if (!res.data || !res.data.result || !res.data.data) break;
+
+        // V2 response: data.content[0].productList
+        var content = res.data.data.content;
+        if (!content || !content.length || !content[0].productList) break;
+        var items = content[0].productList;
         if (!items.length) break;
 
         var filtered = items.filter(function(item) {
-          var name = item.productNameEn || item.productName || '';
+          var name = item.nameEn || '';
           if (/[一-鿿]/.test(name)) return false;
           if (!item.sellPrice || parseFloat(item.sellPrice) <= 0) return false;
           if (parseFloat(item.sellPrice) < 2) return false;
+          // Skip removed/delisted products (saleStatus=3)
+          if (item.saleStatus === '3' || item.saleStatus === 3) return false;
           return true;
         }).map(function(item) {
           return {
-            cjProductId: item.pid,
-            productSku: item.productSku || null,
-            name: item.productNameEn || item.productName,
+            cjProductId: item.id,
+            productSku: item.sku || null,
+            name: item.nameEn,
             category: cat.name,
             price: parseFloat(item.sellPrice),
-            imageUrl: item.productImage || null,
-            productUrl: 'https://cjdropshipping.com/product/' + item.pid + '.html',
-            shippingTime: item.deliveryTime || null,
+            imageUrl: item.bigImage || null,
+            productUrl: 'https://cjdropshipping.com/product/' + item.id + '.html',
+            shippingTime: item.deliveryCycle || null,
           };
         });
 
         categoryProducts = categoryProducts.concat(filtered);
-        console.log('  Page ' + page + ': ' + items.length + ' items, ' + filtered.length + ' valid English');
+        console.log('  Page ' + page + ': ' + items.length + ' items, ' + filtered.length + ' active (filtered out ' + (items.length - filtered.length) + ' removed/invalid)');
 
-        // Stop if CJ returned fewer than a full page
+        // Stop if fewer than full page
         if (items.length < PAGE_SIZE) break;
         page++;
         await sleep(1200);
 
       } catch (err) {
-        console.error('  Fetch error:', err.message);
+        console.error('  V2 fetch error:', (err.response && err.response.data && err.response.data.message) || err.message);
         break;
       }
     }
 
-    console.log('  ' + cat.name + ': ' + categoryProducts.slice(0, TARGET_PER_CATEGORY).length + ' products');
+    console.log('  ' + cat.name + ': ' + categoryProducts.slice(0, TARGET_PER_CATEGORY).length + ' active products');
     allProducts.push.apply(allProducts, categoryProducts.slice(0, TARGET_PER_CATEGORY));
     await sleep(1200);
   }
 
-  console.log('Total in-stock products fetched: ' + allProducts.length);
+  console.log('Total active products fetched: ' + allProducts.length);
   return allProducts;
 }
 
