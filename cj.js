@@ -277,6 +277,7 @@ async function scoreBatch(products, attempt) {
       model: 'claude-sonnet-4-20250514',
       max_tokens: 2000,
       messages: [{ role: 'user', content: prompt }],
+    });
 
     var finalText = response.content
       .filter(function(b) { return b.type === 'text'; })
