@@ -40,12 +40,29 @@ async function getToken() {
 // ─── Category IDs ─────────────────────────────────────────────────────────────
 // CJ category IDs for our target categories
 
+// Real category IDs from CJ API — using second-level category IDs
+// which are broad enough to get good product variety
 const TARGET_CATEGORIES = [
-  { name: 'Pet Supplies',      id: '1371838645393977345' },
-  { name: 'Sports & Outdoors', id: '1370563302736158722' },
-  { name: 'Home & Garden',     id: '1370563302736158720' },
-  { name: 'Beauty & Health',   id: '1370563302736158721' },
-  { name: 'Baby & Kids',       id: '1370563302736158723' },
+  // Pet Supplies subcategories
+  { name: 'Pet Supplies',      id: '2410110335471602500' }, // Pet Toys
+  { name: 'Pet Supplies',      id: '2410110338591602500' }, // Pet Furniture
+  { name: 'Pet Supplies',      id: '2410110339121629200' }, // Pet Bedding
+  { name: 'Pet Supplies',      id: '2410110337231611800' }, // Pet Outdoor Supplies
+  { name: 'Pet Supplies',      id: '2410110338151629800' }, // Pet Apparels
+  // Sports & Outdoors
+  { name: 'Sports & Outdoors', id: '36492F79-E7EB-42F0-8DCC-6129BD9D2AE1' }, // Other Sports Equipment
+  { name: 'Sports & Outdoors', id: '66C86053-159B-436E-B4A9-4A7CCB5CAC8A' }, // Sportswear
+  // Home & Garden
+  { name: 'Home & Garden',     id: '1AD00A3C-465A-430A-9820-F2D097FDA53A' }, // Home Textiles
+  { name: 'Home & Garden',     id: 'ED8E61AA-2260-4E03-BA66-DEAE3DF02CDC' }, // Home Storage
+  { name: 'Home & Garden',     id: 'D5D120D0-1262-461A-97C5-74AC732625B5' }, // Kitchen, Dining & Bar
+  // Beauty & Health
+  { name: 'Beauty & Health',   id: 'CE5FADBB-B432-40B9-8B20-200F6928762A' }, // Beauty Tools
+  { name: 'Beauty & Health',   id: '6289460B-5660-468A-AE43-3D619A05AAC2' }, // Skin Care
+  { name: 'Beauty & Health',   id: '7EAF3E36-620B-4D78-818F-EE80955462A4' }, // Makeup
+  // Baby & Kids
+  { name: 'Baby & Kids',       id: '8C946349-0DC4-4B1E-AC41-E4FE30288DEE' }, // Baby & Mother
+  { name: 'Baby & Kids',       id: '04D68B68-1048-4971-BAFA-18FA0A6DB95C' }, // Toys & Hobbies
 ];
 
 // ─── Pull products from CJ by category ───────────────────────────────────────
@@ -98,7 +115,7 @@ async function fetchAllCJProducts(minPrice) {
 
   // Distribute pages across categories — aim for as many as possible
   // CJ QPS limit is 1/sec so we pace calls
-  const perCategory = 20; // 20 per category x 5 categories = 100 products
+  const perCategory = 10; // 10 per category x 15 categories = ~150 products
   const allProducts = [];
 
   for (var i = 0; i < TARGET_CATEGORIES.length; i++) {
