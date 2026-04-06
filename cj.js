@@ -37,16 +37,29 @@ async function getToken() {
   }
 }
 
+function buildSearchQuery(productName) {
+  // Strip common filler words and use core keywords only
+  var stopWords = ['portable','premium','smart','electric','automatic','professional','mini','ultra','pro','plus','max','new','best','top','high','quality','grade','heavy','duty','multi','super','digital','wireless','rechargeable','adjustable'];
+  var words = productName.toLowerCase()
+    .replace(/[^a-z0-9 ]/g, '')
+    .split(' ')
+    .filter(function(w) { return w.length > 2 && stopWords.indexOf(w) === -1; });
+  // Use first 2-3 meaningful words for best CJ match
+  return words.slice(0, 3).join(' ');
+}
+
 async function searchProduct(productName, token) {
+  var searchQuery = buildSearchQuery(productName);
+  console.log('  CJ searching: "' + searchQuery + '" (from "' + productName + '")');
   try {
     const res = await axios.get(`${CJ_BASE}/product/list`, {
       headers: { 'CJ-Access-Token': token },
-      params: { productName: productName, pageNum: 1, pageSize: 5 },
+      params: { productName: searchQuery, pageNum: 1, pageSize: 5 },
       timeout: 15000,
     });
 
     if (!res.data || !res.data.result || !res.data.data || !res.data.data.list || !res.data.data.list.length) {
-      console.log('  CJ: no results for "' + productName + '"');
+      console.log('  CJ: no results for "' + searchQuery + '"');
       return null;
     }
 
@@ -88,7 +101,16 @@ async function searchAllProducts(products) {
 
   for (var i = 0; i < products.length; i++) {
     var p = products[i];
+    // Try searchQuery first (AliExpress term Claude generated), then fall back to product name
     var cj = await searchProduct(p.searchQuery || p.name, token);
+    // If no match or low confidence, try again with just the product name
+    if (!cj || cj.cjMatchScore < 30) {
+      var cj2 = await searchProduct(p.name, token);
+      await sleep(1200);
+      if (cj2 && (!cj || cj2.cjMatchScore > cj.cjMatchScore)) {
+        cj = cj2;
+      }
+    }
 
     if (cj) {
       console.log('  CJ match: "' + p.name + '" -> "' + cj.cjProductName + '" (' + cj.cjMatchScore + '% match) @ $' + cj.cjPrice);
