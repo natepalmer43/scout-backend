@@ -155,42 +155,24 @@ async function fetchAllCJProducts(minPrice) {
 
 // ─── Claude scores CJ products for trend potential ────────────────────────────
 
-async function scoreBatch(products) {
+async function scoreBatch(products, attempt) {
+  attempt = attempt || 1;
+  if (attempt > 4) { console.error('Max retries hit for batch'); return []; }
+
   var productList = products.map(function(p, i) {
-    return (i + 1) + '. "' + p.name + '" - $' + p.price + ' (' + p.category + ')';
+    return (i + 1) + '. "' + p.name + '" - CJ wholesale: $' + p.price + ' (' + p.category + ')';
   }).join('\n');
 
-  var prompt = 'Score these ' + products.length + ' dropshipping products. Search Amazon and Google Shopping for each to find real retail prices and demand signals.\n\nProducts (with wholesale cost from CJ):\n' + productList + '\n\nFor each product find: (1) what it sells for on Amazon/retail, (2) social media demand signals.\n\nReturn ONLY JSON array, no other text:\n[{"index":1,"tiktok":72,"amazon":68,"reddit":45,"margin":70,"retailPrice":"$29.99","whyTrending":"specific data points","whyDropship":"margin and demand reason","tiktokUrl":null,"amazonUrl":"https://amazon.com/s?k=product","redditUrl":null}]\n\nAll ' + products.length + ' products. retailPrice = what it sells for retail. Honest scores.';
+  // No web search — Claude scores from training knowledge
+  // This is fast, cheap, and never hits rate limits
+  var prompt = 'You are a dropshipping expert. Score these ' + products.length + ' products for dropshipping potential based on your knowledge of consumer trends, social media popularity, and market demand.\n\nProducts (with CJ wholesale cost):\n' + productList + '\n\nFor each product estimate:\n- tiktok: TikTok/social media trend score (0-100)\n- amazon: Amazon demand score (0-100)\n- reddit: Organic community buzz (0-100)\n- margin: Profit margin potential (0-100, based on typical retail price vs wholesale cost shown)\n- retailPrice: What this typically sells for retail (e.g. "$29.99")\n- whyTrending: 1 sentence on why consumers want this\n- whyDropship: 1 sentence on dropship viability\n- amazonUrl: Amazon search URL for this product\n\nReturn ONLY a JSON array, no other text:\n[{"index":1,"tiktok":75,"amazon":68,"reddit":45,"margin":72,"retailPrice":"$34.99","whyTrending":"reason","whyDropship":"reason","amazonUrl":"https://amazon.com/s?k=product+name","tiktokUrl":null,"redditUrl":null}]\n\nAll ' + products.length + ' products required.';
 
   try {
-    var messages = [{ role: 'user', content: prompt }];
     var response = await claude.messages.create({
       model: 'claude-haiku-4-5-20251001',
-      max_tokens: 4000,
-      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-      messages: messages,
+      max_tokens: 2000,
+      messages: [{ role: 'user', content: prompt }],
     });
-
-    var loops = 0;
-    while (response.stop_reason === 'tool_use' && loops < 5) {
-      loops++;
-      var toolResults = [];
-      for (var i = 0; i < response.content.length; i++) {
-        var block = response.content[i];
-        if (block.type === 'tool_use') {
-          console.log('  Searching: ' + (block.input && block.input.query));
-          toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: 'Search completed' });
-        }
-      }
-      messages.push({ role: 'assistant', content: response.content });
-      messages.push({ role: 'user', content: toolResults });
-      response = await claude.messages.create({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 4000,
-        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-        messages: messages,
-      });
-    }
 
     var finalText = response.content
       .filter(function(b) { return b.type === 'text'; })
@@ -198,25 +180,36 @@ async function scoreBatch(products) {
       .join('');
 
     var parsed = extractJSON(finalText);
-    if (!parsed) {
-      // Retry
-      messages.push({ role: 'assistant', content: response.content });
-      messages.push({ role: 'user', content: 'Return ONLY the JSON array, starting with [ and ending with ].' });
-      var retry = await claude.messages.create({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 4000,
-        messages: messages,
-      });
-      var retryText = retry.content.filter(function(b) { return b.type === 'text'; }).map(function(b) { return b.text; }).join('');
-      parsed = extractJSON(retryText);
-    }
+    if (parsed) { return parsed; }
 
-    return parsed || [];
+    // Retry once asking for clean JSON
+    var retry = await claude.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 2000,
+      messages: [
+        { role: 'user', content: prompt },
+        { role: 'assistant', content: finalText },
+        { role: 'user', content: 'Return ONLY the JSON array starting with [ and ending with ]. No other text.' }
+      ],
+    });
+    var retryText = retry.content.filter(function(b) { return b.type === 'text'; }).map(function(b) { return b.text; }).join('');
+    return extractJSON(retryText) || [];
+
   } catch (err) {
-    console.error('Claude scoring error:', err.message);
+    var msg = err.message || '';
+    var isRateLimit = msg.indexOf('429') !== -1 || msg.indexOf('rate_limit') !== -1;
+    if (isRateLimit) {
+      var waitMs = attempt * 10000;
+      console.log('Rate limit hit, waiting ' + (waitMs/1000) + 's (attempt ' + attempt + ')...');
+      await sleep(waitMs);
+      return scoreBatch(products, attempt + 1);
+    }
+    console.error('Claude scoring error:', msg);
     return [];
   }
 }
+
+
 
 function extractJSON(text) {
   if (!text) return null;
@@ -255,7 +248,7 @@ async function fetchAndScoreCJProducts(minPrice) {
   }
 
   // Step 2: Score in batches of 10 to stay within rate limits
-  var batchSize = 5;
+  var batchSize = 10;
   var allScored = [];
 
   for (var i = 0; i < cjProducts.length; i += batchSize) {
@@ -326,8 +319,7 @@ async function fetchAndScoreCJProducts(minPrice) {
 
     // Pause between batches
     if (i + batchSize < cjProducts.length) {
-      console.log('Waiting 8s before next batch...');
-      await sleep(8000);
+      await sleep(3000);
     }
   }
 
