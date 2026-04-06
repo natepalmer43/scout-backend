@@ -118,8 +118,6 @@ async function fetchCategoryProducts(token, categoryId, categoryName, pageSize) 
         pageSize: pageSize,
         sortField: 'orderCount',
         sortType: 'DESC',
-        listingStatus: 1,       // 1 = listed/active only
-        countryCode: 'US',      // US warehouse products
       },
       timeout: 20000,
     });
@@ -166,36 +164,82 @@ async function fetchAllCJProducts(minPrice) {
   const token = await getToken();
   if (!token) return [];
 
-  // Distribute pages across categories — aim for as many as possible
-  // CJ QPS limit is 1/sec so we pace calls
-  const perCategory = 10; // 10 per category x 15 categories = ~150 products
+  const PAGE_SIZE = 20;
+  const TARGET_PER_CATEGORY = 10;
   const allProducts = [];
 
   for (var i = 0; i < TARGET_CATEGORIES.length; i++) {
     var cat = TARGET_CATEGORIES[i];
-    console.log('Fetching CJ category: ' + cat.name);
-    var products = await fetchCategoryProducts(token, cat.id, cat.name, perCategory);
+    console.log('Fetching category: ' + cat.name);
+    var categoryProducts = [];
+    var page = 1;
 
-    // Apply price filter if set
-    if (minPrice > 0) {
-      products = products.filter(function(p) {
-        var price = parseFloat(p.price) || 0;
-        return price >= minPrice;
-      });
+    while (categoryProducts.length < TARGET_PER_CATEGORY && page <= 3) {
+      try {
+        var params = {
+          categoryId: cat.id,
+          pageNum: page,
+          pageSize: PAGE_SIZE,
+          sortField: 'orderCount',
+          sortType: 'DESC',
+          startInventory: 1,  // ONLY products with inventory >= 1
+          verifiedWarehouse: 1, // ONLY verified inventory
+        };
+        if (minPrice > 0) params.minPrice = minPrice;
+
+        var res = await axios.get(CJ_BASE + '/product/list', {
+          headers: { 'CJ-Access-Token': token },
+          params: params,
+          timeout: 20000,
+        });
+
+        if (!res.data || !res.data.result || !res.data.data || !res.data.data.list) break;
+        var items = res.data.data.list;
+        if (!items.length) break;
+
+        var filtered = items.filter(function(item) {
+          var name = item.productNameEn || item.productName || '';
+          if (/[一-鿿]/.test(name)) return false;
+          if (!item.sellPrice || parseFloat(item.sellPrice) <= 0) return false;
+          if (parseFloat(item.sellPrice) < 2) return false;
+          return true;
+        }).map(function(item) {
+          return {
+            cjProductId: item.pid,
+            productSku: item.productSku || null,
+            name: item.productNameEn || item.productName,
+            category: cat.name,
+            price: parseFloat(item.sellPrice),
+            imageUrl: item.productImage || null,
+            productUrl: 'https://cjdropshipping.com/product/' + item.pid + '.html',
+            shippingTime: item.deliveryTime || null,
+          };
+        });
+
+        categoryProducts = categoryProducts.concat(filtered);
+        console.log('  Page ' + page + ': ' + items.length + ' items, ' + filtered.length + ' valid English');
+
+        // Stop if CJ returned fewer than a full page
+        if (items.length < PAGE_SIZE) break;
+        page++;
+        await sleep(1200);
+
+      } catch (err) {
+        console.error('  Fetch error:', err.message);
+        break;
+      }
     }
 
-    allProducts.push.apply(allProducts, products);
-    await sleep(1200); // respect QPS limit
+    console.log('  ' + cat.name + ': ' + categoryProducts.slice(0, TARGET_PER_CATEGORY).length + ' products');
+    allProducts.push.apply(allProducts, categoryProducts.slice(0, TARGET_PER_CATEGORY));
+    await sleep(1200);
   }
 
-  console.log('Total CJ products fetched: ' + allProducts.length);
-
-  // Verify products still exist on CJ before scoring
-  // This eliminates removed/delisted products
-  console.log('Verifying products are still active on CJ...');
-  var verified = await verifyProductsBatch(allProducts, token);
-  return verified;
+  console.log('Total in-stock products fetched: ' + allProducts.length);
+  return allProducts;
 }
+
+
 
 // ─── Claude scores CJ products for trend potential ────────────────────────────
 
