@@ -146,7 +146,7 @@ async function scoreBatch(products) {
     return (i + 1) + '. "' + p.name + '" - $' + p.price + ' (' + p.category + ')';
   }).join('\n');
 
-  var prompt = 'You are a dropshipping expert. Search the web to evaluate these ' + products.length + ' products from CJ Dropshipping for their current trend potential and dropshipping viability.\n\nProducts:\n' + productList + '\n\nFor each product search for current social media buzz, Amazon sales data, and consumer demand. Then return ONLY a JSON array:\n[\n  {\n    "index": 1,\n    "tiktok": 72,\n    "amazon": 68,\n    "reddit": 45,\n    "margin": 70,\n    "whyTrending": "specific reason with data points",\n    "whyDropship": "why good for dropshipping",\n    "tiktokUrl": null,\n    "amazonUrl": "https://amazon.com/s?k=search+term",\n    "redditUrl": null\n  }\n]\n\nScoring 0-100. signals threshold >= 65. Be honest — low scores for products with no buzz. Return all ' + products.length + ' products scored.';
+  var prompt = 'Score these ' + products.length + ' dropshipping products for trend potential. Search the web for each.\n\nProducts:\n' + productList + '\n\nReturn ONLY JSON array:\n[{"index":1,"tiktok":72,"amazon":68,"reddit":45,"margin":70,"whyTrending":"reason","whyDropship":"reason","tiktokUrl":null,"amazonUrl":null,"redditUrl":null}]\n\nAll ' + products.length + ' products. Honest scores 0-100.';
 
   try {
     var messages = [{ role: 'user', content: prompt }];
@@ -241,7 +241,7 @@ async function fetchAndScoreCJProducts(minPrice) {
   }
 
   // Step 2: Score in batches of 10 to stay within rate limits
-  var batchSize = 10;
+  var batchSize = 5;
   var allScored = [];
 
   for (var i = 0; i < cjProducts.length; i += batchSize) {
@@ -303,7 +303,8 @@ async function fetchAndScoreCJProducts(minPrice) {
 
     // Pause between batches
     if (i + batchSize < cjProducts.length) {
-      await sleep(2000);
+      console.log('Waiting 8s before next batch...');
+      await sleep(8000);
     }
   }
 
