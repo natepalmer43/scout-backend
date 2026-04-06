@@ -38,25 +38,42 @@ async function getToken() {
 }
 
 async function verifyProduct(p, token) {
-  // Use CJ's stock endpoint to check real inventory
-  // If no SKU available fall back to product query
-  if (!p.productSku) return true; // can't verify without SKU, assume active
+  // Use CJ's inventory-by-pid endpoint — works with product ID, no SKU needed
+  if (!p.cjProductId) return true;
 
   try {
-    var res = await axios.get(CJ_BASE + '/product/stock/queryBySku', {
+    var res = await axios.get(CJ_BASE + '/product/stock/getInventoryByPid', {
       headers: { 'CJ-Access-Token': token },
-      params: { sku: p.productSku },
+      params: { pid: p.cjProductId },
       timeout: 10000,
     });
-    if (!res.data || !res.data.result || !res.data.data) return false;
+
+    // Log raw response for first few products so we can see the actual structure
+    if (!verifyProduct._logCount) verifyProduct._logCount = 0;
+    if (verifyProduct._logCount < 3) {
+      console.log('  [inventory debug] ' + p.name + ': ' + JSON.stringify(res.data).slice(0, 500));
+      verifyProduct._logCount++;
+    }
+
+    if (!res.data || !res.data.result) return true; // API error, assume active
     var data = res.data.data;
-    // Check total inventory across all warehouses
-    var total = data.totalInventoryNum || 0;
-    var factory = data.factoryInventoryNum || 0;
-    // Product is available if it has any inventory at all
-    return (total + factory) > 0;
+
+    // If data is null/undefined/empty, product may be removed
+    if (!data) return false;
+
+    // data could be an array of warehouses or an object — handle both
+    var inventories = Array.isArray(data) ? data : (data.inventories || data.list || [data]);
+
+    var totalStock = 0;
+    for (var i = 0; i < inventories.length; i++) {
+      var wh = inventories[i];
+      totalStock += (wh.totalInventoryNum || wh.inventoryNum || wh.qty || 0);
+    }
+
+    return totalStock > 0;
   } catch (err) {
-    // If stock endpoint errors, assume active to avoid over-filtering
+    // If endpoint errors, assume active to avoid over-filtering
+    console.log('  [inventory check error] ' + p.name + ': ' + (err.message || ''));
     return true;
   }
 }
