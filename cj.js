@@ -9,28 +9,26 @@ let tokenExpiry = null;
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// ─── Auth ─────────────────────────────────────────────────────────────────────
+
 async function getToken() {
   if (accessToken && tokenExpiry && new Date() < new Date(tokenExpiry)) {
     return accessToken;
   }
-
   const CJ_API_KEY = process.env.CJ_API_KEY;
-  if (!CJ_API_KEY) { console.error('No CJ_API_KEY set'); return null; }
-
+  if (!CJ_API_KEY) { console.error('No CJ_API_KEY'); return null; }
   try {
     const res = await axios.post(
       `${CJ_BASE}/authentication/getAccessToken`,
       { apiKey: CJ_API_KEY },
       { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
     );
-
     if (res.data && res.data.result && res.data.data && res.data.data.accessToken) {
       accessToken = res.data.data.accessToken;
       tokenExpiry = res.data.data.accessTokenExpiryDate;
-      console.log('CJ authenticated successfully');
+      console.log('CJ authenticated');
       return accessToken;
     }
-
     console.error('CJ auth failed:', res.data && res.data.message);
     return null;
   } catch (err) {
@@ -39,146 +37,261 @@ async function getToken() {
   }
 }
 
-function buildSearchQuery(productName) {
-  // Strip common filler words and use core keywords only
-  var stopWords = ['portable','premium','smart','electric','automatic','professional','mini','ultra','pro','plus','max','new','best','top','high','quality','grade','heavy','duty','multi','super','digital','wireless','rechargeable','adjustable'];
-  var words = productName.toLowerCase()
-    .replace(/[^a-z0-9 ]/g, '')
-    .split(' ')
-    .filter(function(w) { return w.length > 2 && stopWords.indexOf(w) === -1; });
-  // Use first 2-3 meaningful words for best CJ match
-  return words.slice(0, 3).join(' ');
-}
+// ─── Category IDs ─────────────────────────────────────────────────────────────
+// CJ category IDs for our target categories
 
-async function searchProduct(productName, token) {
-  var searchQuery = buildSearchQuery(productName);
-  console.log('  CJ searching: "' + searchQuery + '" (from "' + productName + '")');
+const TARGET_CATEGORIES = [
+  { name: 'Pet Supplies',      id: '1371838645393977345' },
+  { name: 'Sports & Outdoors', id: '1370563302736158722' },
+  { name: 'Home & Garden',     id: '1370563302736158720' },
+  { name: 'Beauty & Health',   id: '1370563302736158721' },
+  { name: 'Baby & Kids',       id: '1370563302736158723' },
+];
+
+// ─── Pull products from CJ by category ───────────────────────────────────────
+
+async function fetchCategoryProducts(token, categoryId, categoryName, pageSize) {
   try {
     const res = await axios.get(`${CJ_BASE}/product/list`, {
       headers: { 'CJ-Access-Token': token },
-      params: { productName: searchQuery, pageNum: 1, pageSize: 5 },
-      timeout: 15000,
+      params: {
+        categoryId: categoryId,
+        pageNum: 1,
+        pageSize: pageSize,
+        sortField: 'orderCount',  // sort by most ordered = proven sellers
+        sortType: 'DESC',
+      },
+      timeout: 20000,
     });
 
-    if (!res.data || !res.data.result || !res.data.data || !res.data.data.list || !res.data.data.list.length) {
-      console.log('  CJ: no results for "' + searchQuery + '"');
-      return null;
+    if (!res.data || !res.data.result || !res.data.data || !res.data.data.list) {
+      console.log('  No results for category: ' + categoryName);
+      return [];
     }
 
     const items = res.data.data.list;
-    // Return all candidates for Claude to evaluate
-    return items.slice(0, 5).map(function(item) {
+    console.log('  ' + categoryName + ': ' + items.length + ' products fetched');
+
+    return items.map(function(item) {
       return {
-        id: item.pid,
+        cjProductId: item.pid,
         name: item.productName,
+        category: categoryName,
         price: item.sellPrice,
-        image: item.productImage,
-        url: 'https://cjdropshipping.com/product/' + item.pid + '.html',
+        imageUrl: item.productImage || null,
+        productUrl: 'https://cjdropshipping.com/product/' + item.pid + '.html',
         shippingTime: item.deliveryTime || null,
+        weight: item.productWeight || null,
       };
     });
   } catch (err) {
-    console.error('CJ search error for "' + productName + '":', (err.response && err.response.data && err.response.data.message) || err.message);
-    return null;
+    console.error('CJ category fetch error (' + categoryName + '):', (err.response && err.response.data && err.response.data.message) || err.message);
+    return [];
   }
 }
 
+// ─── Pull all target categories ───────────────────────────────────────────────
 
-async function claudePickBestMatch(targetProduct, cjCandidates) {
-  if (!cjCandidates || !cjCandidates.length) return null;
-  if (cjCandidates.length === 1) return cjCandidates[0];
+async function fetchAllCJProducts(minPrice) {
+  const token = await getToken();
+  if (!token) return [];
+
+  // Distribute pages across categories — aim for as many as possible
+  // CJ QPS limit is 1/sec so we pace calls
+  const perCategory = 20; // 20 per category x 5 categories = 100 products
+  const allProducts = [];
+
+  for (var i = 0; i < TARGET_CATEGORIES.length; i++) {
+    var cat = TARGET_CATEGORIES[i];
+    console.log('Fetching CJ category: ' + cat.name);
+    var products = await fetchCategoryProducts(token, cat.id, cat.name, perCategory);
+
+    // Apply price filter if set
+    if (minPrice > 0) {
+      products = products.filter(function(p) {
+        var price = parseFloat(p.price) || 0;
+        return price >= minPrice;
+      });
+    }
+
+    allProducts.push.apply(allProducts, products);
+    await sleep(1200); // respect QPS limit
+  }
+
+  console.log('Total CJ products fetched: ' + allProducts.length);
+  return allProducts;
+}
+
+// ─── Claude scores CJ products for trend potential ────────────────────────────
+
+async function scoreBatch(products) {
+  var productList = products.map(function(p, i) {
+    return (i + 1) + '. "' + p.name + '" - $' + p.price + ' (' + p.category + ')';
+  }).join('\n');
+
+  var prompt = 'You are a dropshipping expert. Search the web to evaluate these ' + products.length + ' products from CJ Dropshipping for their current trend potential and dropshipping viability.\n\nProducts:\n' + productList + '\n\nFor each product search for current social media buzz, Amazon sales data, and consumer demand. Then return ONLY a JSON array:\n[\n  {\n    "index": 1,\n    "tiktok": 72,\n    "amazon": 68,\n    "reddit": 45,\n    "margin": 70,\n    "whyTrending": "specific reason with data points",\n    "whyDropship": "why good for dropshipping",\n    "tiktokUrl": null,\n    "amazonUrl": "https://amazon.com/s?k=search+term",\n    "redditUrl": null\n  }\n]\n\nScoring 0-100. signals threshold >= 65. Be honest — low scores for products with no buzz. Return all ' + products.length + ' products scored.';
 
   try {
-    var candidateList = cjCandidates.map(function(c, i) {
-      return (i+1) + '. "' + c.name + '" @ $' + c.price;
-    }).join('\n');
-
+    var messages = [{ role: 'user', content: prompt }];
     var response = await claude.messages.create({
       model: 'claude-haiku-4-5-20251001',
-      max_tokens: 100,
-      messages: [{
-        role: 'user',
-        content: 'I am looking for a dropshipping supplier match for: "' + targetProduct + '"\n\nCJ Dropshipping has these options:\n' + candidateList + '\n\nWhich number is the best match? If none are a reasonable match for the same type of product, say "none". Reply with just the number or "none".'
-      }]
+      max_tokens: 4000,
+      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+      messages: messages,
     });
 
-    var answer = response.content[0].text.trim().toLowerCase();
-    if (answer === 'none') return null;
-    var num = parseInt(answer);
-    if (!isNaN(num) && num >= 1 && num <= cjCandidates.length) {
-      console.log('  Claude picked match #' + num + ': "' + cjCandidates[num-1].name + '"');
-      return cjCandidates[num-1];
+    var loops = 0;
+    while (response.stop_reason === 'tool_use' && loops < 5) {
+      loops++;
+      var toolResults = [];
+      for (var i = 0; i < response.content.length; i++) {
+        var block = response.content[i];
+        if (block.type === 'tool_use') {
+          console.log('  Searching: ' + (block.input && block.input.query));
+          toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: 'Search completed' });
+        }
+      }
+      messages.push({ role: 'assistant', content: response.content });
+      messages.push({ role: 'user', content: toolResults });
+      response = await claude.messages.create({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 4000,
+        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+        messages: messages,
+      });
     }
-    return cjCandidates[0];
-  } catch(err) {
-    console.error('Claude match error:', err.message);
-    return cjCandidates[0];
+
+    var finalText = response.content
+      .filter(function(b) { return b.type === 'text'; })
+      .map(function(b) { return b.text; })
+      .join('');
+
+    var parsed = extractJSON(finalText);
+    if (!parsed) {
+      // Retry
+      messages.push({ role: 'assistant', content: response.content });
+      messages.push({ role: 'user', content: 'Return ONLY the JSON array, starting with [ and ending with ].' });
+      var retry = await claude.messages.create({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 4000,
+        messages: messages,
+      });
+      var retryText = retry.content.filter(function(b) { return b.type === 'text'; }).map(function(b) { return b.text; }).join('');
+      parsed = extractJSON(retryText);
+    }
+
+    return parsed || [];
+  } catch (err) {
+    console.error('Claude scoring error:', err.message);
+    return [];
   }
 }
 
-async function searchAllProducts(products) {
-  const token = await getToken();
-  if (!token) {
-    console.log('CJ auth failed — skipping supplier matching');
-    return products;
+function extractJSON(text) {
+  if (!text) return null;
+  var clean = text.replace(/```json/gi, '').replace(/```/g, '').trim();
+  var start = clean.indexOf('[');
+  var end = clean.lastIndexOf(']');
+  if (start === -1 || end === -1 || end <= start) return null;
+  try {
+    var arr = JSON.parse(clean.slice(start, end + 1));
+    if (Array.isArray(arr) && arr.length > 0) return arr;
+  } catch(e) {
+    try {
+      var fixed = clean.slice(start, end + 1).replace(/,\s*}/g, '}').replace(/,\s*]/g, ']');
+      var arr2 = JSON.parse(fixed);
+      if (Array.isArray(arr2) && arr2.length > 0) return arr2;
+    } catch(e2) {}
+  }
+  return null;
+}
+
+function validUrl(u) {
+  if (!u || u === 'null' || u === 'undefined') return null;
+  try { new URL(u); return u; } catch(e) { return null; }
+}
+
+function clamp(v) { return Math.min(100, Math.max(0, Math.round(Number(v) || 0))); }
+
+// ─── Main export — replaces old approach entirely ─────────────────────────────
+
+async function fetchAndScoreCJProducts(minPrice) {
+  // Step 1: Pull real products from CJ
+  var cjProducts = await fetchAllCJProducts(minPrice || 0);
+  if (!cjProducts.length) {
+    console.log('No CJ products fetched');
+    return [];
   }
 
-  const results = [];
+  // Step 2: Score in batches of 10 to stay within rate limits
+  var batchSize = 10;
+  var allScored = [];
 
-  for (var i = 0; i < products.length; i++) {
-    var p = products[i];
-    // Try searchQuery first (AliExpress term Claude generated), then fall back to product name
-    // Get CJ candidates
-    var candidates = await searchProduct(p.searchQuery || p.name, token);
-    await sleep(1200);
+  for (var i = 0; i < cjProducts.length; i += batchSize) {
+    var batch = cjProducts.slice(i, i + batchSize);
+    console.log('Scoring batch ' + (Math.floor(i/batchSize)+1) + '/' + Math.ceil(cjProducts.length/batchSize) + ' (' + batch.length + ' products)...');
 
-    // If no results with searchQuery, try product name
-    if (!candidates || !candidates.length) {
-      candidates = await searchProduct(p.name, token);
-      await sleep(1200);
-    }
+    var scores = await scoreBatch(batch);
 
-    // Have Claude pick the best match from candidates
-    var best = null;
-    if (candidates && candidates.length) {
-      best = await claudePickBestMatch(p.name, candidates);
-      await sleep(500); // small delay after Claude call
-    }
+    scores.forEach(function(s) {
+      var idx = (s.index || 0) - 1;
+      if (idx < 0 || idx >= batch.length) return;
+      var cjProduct = batch[idx];
 
-    if (best) {
-      console.log('  Matched: "' + p.name + '" -> "' + best.name + '" @ $' + best.price);
-      results.push(Object.assign({}, p, {
+      var tiktok = clamp(s.tiktok);
+      var amazon = clamp(s.amazon);
+      var reddit = clamp(s.reddit);
+      var margin = clamp(s.margin);
+      var overall = Math.round(tiktok*0.40 + amazon*0.30 + reddit*0.15 + margin*0.15);
+
+      var signals = [];
+      if (tiktok >= 65) signals.push('tiktok');
+      if (amazon >= 65) signals.push('amazon');
+      if (reddit >= 65) signals.push('reddit');
+      if (margin >= 65) signals.push('margin');
+
+      allScored.push({
+        id: 'cj_' + cjProduct.cjProductId,
+        name: cjProduct.name,
+        category: cjProduct.category,
+        tiktok: tiktok,
+        amazon: amazon,
+        reddit: reddit,
+        margin: margin,
+        score: overall,
+        signals: signals,
+        source: 'cj',
+        retailPrice: null,  // Claude will estimate or leave blank
+        wholesaleEstimate: cjProduct.price ? '$' + cjProduct.price + ' (CJ)' : null,
+        whyTrending: s.whyTrending || '',
+        whyDropship: s.whyDropship || '',
+        tiktokUrl: validUrl(s.tiktokUrl),
+        amazonUrl: validUrl(s.amazonUrl),
+        redditUrl: validUrl(s.redditUrl),
+        imageUrl: cjProduct.imageUrl || null,
+        searchQuery: cjProduct.name,
         cj: {
           found: true,
-          productId: best.id,
-          productName: best.name,
-          price: best.price,
-          shippingTime: best.shippingTime,
-          imageUrl: best.image,
-          productUrl: best.url,
-          allMatches: candidates.slice(0, 3),
+          productId: cjProduct.cjProductId,
+          productName: cjProduct.name,
+          price: cjProduct.price,
+          shippingTime: cjProduct.shippingTime,
+          imageUrl: cjProduct.imageUrl,
+          productUrl: cjProduct.productUrl,
+          allMatches: [],
         },
-        wholesaleEstimate: best.price ? '$' + best.price + ' (CJ live)' : p.wholesaleEstimate,
-        imageUrl: p.imageUrl || best.image || null,
-      }));
-    } else {
-      console.log('  No CJ match found for: "' + p.name + '"');
-      results.push(Object.assign({}, p, { cj: { found: false } }));
-    }
+        scannedAt: new Date().toISOString(),
+      });
+    });
 
-    await sleep(1200);
+    // Pause between batches
+    if (i + batchSize < cjProducts.length) {
+      await sleep(2000);
+    }
   }
 
-  var matched = results.filter(function(p) { return p.cj && p.cj.found; }).length;
-  console.log('CJ matching complete: ' + matched + '/' + products.length + ' matched');
-  return results;
+  console.log('Scored ' + allScored.length + ' products from CJ');
+  return allScored.sort(function(a, b) { return b.score - a.score; });
 }
 
-function calcMatchScore(query, result) {
-  var q = (query || '').toLowerCase().split(' ').filter(function(w) { return w.length > 2; });
-  var r = (result || '').toLowerCase();
-  var matches = q.filter(function(w) { return r.includes(w); }).length;
-  return Math.round((matches / Math.max(q.length, 1)) * 100);
-}
-
-module.exports = { searchAllProducts: searchAllProducts, getToken: getToken };
+module.exports = { fetchAndScoreCJProducts: fetchAndScoreCJProducts };
