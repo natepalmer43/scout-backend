@@ -2,6 +2,7 @@ const express = require('express');
 const cron = require('node-cron');
 const cors = require('cors');
 const Anthropic = require('@anthropic-ai/sdk');
+const { searchProduct } = require('./cj');
 require('dotenv').config();
 
 const app = express();
@@ -21,11 +22,11 @@ let currentMinPrice = 0;
 
 async function researchProducts(minPrice = 0) {
   const priceContext = minPrice > 0
-    ? `IMPORTANT: Only find products that retail for $${minPrice} or more. Ignore cheap products under $${minPrice}.`
+    ? `IMPORTANT: Only find products that retail for $${minPrice} or more. Ignore anything cheaper.`
     : 'Include products at any price point.';
 
   const priceSearch = minPrice > 0
-    ? `trending products over $${minPrice}, premium dropshipping products $${minPrice}+`
+    ? `trending products over $${minPrice} 2026, premium dropshipping products $${minPrice}+`
     : 'tiktok trending products 2026, amazon best sellers rising this week';
 
   console.log(`Researching products — min price: ${minPrice > 0 ? '$' + minPrice : 'any'}`);
@@ -59,7 +60,7 @@ Return ONLY a JSON array, no other text, starting with [ and ending with ]:
   }
 ]
 
-Find 10 products. Only physical goods. No food, regulated items, or branded products. signals only includes sources with score >= 65.${minPrice > 0 ? ` Every product must have a retail price of $${minPrice} or higher.` : ''}`;
+Find 10 products. Only physical goods. No food, regulated items, or branded products. signals only includes sources with score >= 65.${minPrice > 0 ? ` Every product must retail for $${minPrice} or more.` : ''}`;
 
   try {
     const messages = [{ role: 'user', content: prompt }];
@@ -96,7 +97,7 @@ Find 10 products. Only physical goods. No food, regulated items, or branded prod
     const parsed = extractJSON(finalText);
     if (parsed) { console.log(`Found ${parsed.length} products`); return parsed; }
 
-    // Retry — ask to reformat
+    // Retry
     console.log('Retrying JSON extraction...');
     messages.push({ role: 'assistant', content: response.content });
     messages.push({ role: 'user', content: 'Respond with ONLY the JSON array. Start with [ and end with ]. No other text.' });
@@ -135,8 +136,56 @@ function extractJSON(text) {
   return null;
 }
 
-function clamp(v) { return Math.min(100, Math.max(0, Math.round(Number(v) || 0))); }
+// ─── CJ supplier matching ─────────────────────────────────────────────────────
 
+async function enrichWithCJ(products) {
+  if (!process.env.CJ_API_KEY) {
+    console.log('No CJ_API_KEY — skipping supplier matching');
+    return products;
+  }
+
+  console.log(`Matching ${products.length} products against CJ catalog...`);
+
+  const enriched = await Promise.all(products.map(async (p) => {
+    try {
+      const cj = await searchProduct(p.searchQuery || p.name);
+      if (!cj) return p;
+
+      console.log(`  CJ match for "${p.name}": "${cj.cjProductName}" (${cj.cjMatchScore}% match) @ $${cj.cjPrice}`);
+
+      return {
+        ...p,
+        cj: {
+          found: true,
+          matchScore: cj.cjMatchScore,
+          productId: cj.cjProductId,
+          productName: cj.cjProductName,
+          price: cj.cjPrice,
+          currency: cj.cjCurrency,
+          shippingTime: cj.cjShippingTime,
+          imageUrl: cj.cjImageUrl,
+          productUrl: cj.cjProductUrl,
+          allMatches: cj.allMatches,
+        },
+        // Override wholesale estimate with real CJ price
+        wholesaleEstimate: cj.cjPrice ? `$${cj.cjPrice} (CJ)` : p.wholesaleEstimate,
+        // Use CJ image if we don't have one
+        imageUrl: p.imageUrl || cj.cjImageUrl || null,
+      };
+    } catch (err) {
+      console.error(`CJ enrichment error for ${p.name}:`, err.message);
+      return p;
+    }
+  }));
+
+  const matched = enriched.filter(p => p.cj?.found).length;
+  console.log(`CJ matching complete: ${matched}/${products.length} products matched`);
+  return enriched;
+}
+
+// ─── Process ──────────────────────────────────────────────────────────────────
+
+function clamp(v) { return Math.min(100, Math.max(0, Math.round(Number(v) || 0))); }
 function validUrl(u) {
   if (!u || u === 'null' || u === 'undefined') return null;
   try { new URL(u); return u; } catch { return null; }
@@ -173,32 +222,44 @@ function processProducts(raw, minPrice = 0) {
       redditUrl: validUrl(p.redditUrl),
       imageUrl: validUrl(p.imageUrl),
       searchQuery: p.searchQuery || p.name,
+      cj: p.cj || null,
       scannedAt: new Date().toISOString(),
     }))
     .sort((a, b) => b.score - a.score)
     .slice(0, 20);
 }
 
-// ─── Scan ─────────────────────────────────────────────────────────────────────
+// ─── Main scan ────────────────────────────────────────────────────────────────
 
 async function runScan(minPrice = 0) {
   console.log(`\n[${new Date().toISOString()}] Starting scan (minPrice: $${minPrice})...`);
   currentMinPrice = minPrice;
+
   const raw = await researchProducts(minPrice);
-  if (raw.length > 0) {
-    products = processProducts(raw, minPrice);
-  } else {
+  if (raw.length === 0) {
     console.log('No products returned — keeping previous results');
+    lastScan = new Date().toISOString();
+    return;
   }
+
+  let processed = processProducts(raw, minPrice);
+  processed = await enrichWithCJ(processed);
+
+  products = processed;
   lastScan = new Date().toISOString();
   scanLog.unshift({ scannedAt: lastScan, count: products.length, minPrice });
   if (scanLog.length > 20) scanLog = scanLog.slice(0, 20);
-  console.log(`Scan complete. ${products.length} products.`);
+
+  const cjMatched = products.filter(p => p.cj?.found).length;
+  console.log(`Scan complete. ${products.length} products (${cjMatched} matched on CJ).`);
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
-app.get('/health', (req, res) => res.json({ status: 'ok', lastScan, productCount: products.length, currentMinPrice }));
+app.get('/health', (req, res) => res.json({
+  status: 'ok', lastScan, productCount: products.length,
+  cjEnabled: !!process.env.CJ_API_KEY, currentMinPrice
+}));
 
 app.get('/products', (req, res) => res.json({
   products, lastScan, currentMinPrice,
@@ -206,18 +267,13 @@ app.get('/products', (req, res) => res.json({
   scanLog,
 }));
 
-// Accept minPrice from frontend
 app.post('/scan', async (req, res) => {
   const minPrice = parseInt(req.body?.minPrice) || 0;
   res.json({ status: scanning ? 'already_scanning' : 'started', minPrice });
-  if (!scanning) {
-    scanning = true;
-    await runScan(minPrice);
-    scanning = false;
-  }
+  if (!scanning) { scanning = true; await runScan(minPrice); scanning = false; }
 });
 
-// ─── Scheduler — use last known minPrice ──────────────────────────────────────
+// ─── Scheduler ────────────────────────────────────────────────────────────────
 
 cron.schedule('0 */3 * * *', async () => {
   if (!scanning) { scanning = true; await runScan(currentMinPrice); scanning = false; }
@@ -227,6 +283,7 @@ cron.schedule('0 */3 * * *', async () => {
 
 app.listen(PORT, async () => {
   console.log(`Scout backend running on port ${PORT}`);
+  console.log(`CJ Dropshipping: ${process.env.CJ_API_KEY ? 'enabled' : 'disabled (no CJ_API_KEY)'}`);
   scanning = true;
   await runScan(0);
   scanning = false;
