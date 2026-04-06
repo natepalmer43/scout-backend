@@ -37,6 +37,37 @@ async function getToken() {
   }
 }
 
+async function verifyProduct(pid, token) {
+  try {
+    const res = await axios.get(`${CJ_BASE}/product/query`, {
+      headers: { 'CJ-Access-Token': token },
+      params: { pid: pid },
+      timeout: 10000,
+    });
+    // Product exists and is active if we get a successful response with data
+    return res.data && res.data.result && res.data.data && res.data.data.productName;
+  } catch (err) {
+    return false;
+  }
+}
+
+async function verifyProductsBatch(products, token) {
+  var verified = [];
+  for (var i = 0; i < products.length; i++) {
+    var p = products[i];
+    var exists = await verifyProduct(p.cjProductId, token);
+    if (exists) {
+      verified.push(p);
+    } else {
+      console.log('  Removed from CJ: ' + p.name);
+    }
+    await sleep(1200);
+  }
+  console.log('Verified ' + verified.length + '/' + products.length + ' products still active on CJ');
+  return verified;
+}
+
+
 // ─── Category IDs ─────────────────────────────────────────────────────────────
 // CJ category IDs for our target categories
 
@@ -150,7 +181,12 @@ async function fetchAllCJProducts(minPrice) {
   }
 
   console.log('Total CJ products fetched: ' + allProducts.length);
-  return allProducts;
+
+  // Verify products still exist on CJ before scoring
+  // This eliminates removed/delisted products
+  console.log('Verifying products are still active on CJ...');
+  var verified = await verifyProductsBatch(allProducts, token);
+  return verified;
 }
 
 // ─── Claude scores CJ products for trend potential ────────────────────────────
