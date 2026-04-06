@@ -37,24 +37,27 @@ async function getToken() {
   }
 }
 
-async function verifyProduct(pid) {
+async function verifyProduct(p, token) {
+  // Use CJ's stock endpoint to check real inventory
+  // If no SKU available fall back to product query
+  if (!p.productSku) return true; // can't verify without SKU, assume active
+
   try {
-    // Check the actual CJ product page — if it redirects or returns non-200, product is gone
-    var url = 'https://cjdropshipping.com/product/p-' + pid + '.html';
-    var res = await axios.get(url, {
+    var res = await axios.get(CJ_BASE + '/product/stock/queryBySku', {
+      headers: { 'CJ-Access-Token': token },
+      params: { sku: p.productSku },
       timeout: 10000,
-      maxRedirects: 3,
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-      validateStatus: function(status) { return true; } // don't throw on any status
     });
-    // Product is live if page returns 200 and doesn't contain removal text
-    if (res.status !== 200) return false;
-    var body = res.data || '';
-    if (body.indexOf('Product removed') !== -1) return false;
-    if (body.indexOf('Sourcing') !== -1 && body.indexOf('Contact Us') !== -1) return false;
-    return true;
+    if (!res.data || !res.data.result || !res.data.data) return false;
+    var data = res.data.data;
+    // Check total inventory across all warehouses
+    var total = data.totalInventoryNum || 0;
+    var factory = data.factoryInventoryNum || 0;
+    // Product is available if it has any inventory at all
+    return (total + factory) > 0;
   } catch (err) {
-    return false;
+    // If stock endpoint errors, assume active to avoid over-filtering
+    return true;
   }
 }
 
@@ -62,15 +65,15 @@ async function verifyProductsBatch(products, token) {
   var verified = [];
   for (var i = 0; i < products.length; i++) {
     var p = products[i];
-    var exists = await verifyProduct(p.cjProductId);
+    var exists = await verifyProduct(p, token);
     if (exists) {
       verified.push(p);
     } else {
-      console.log('  Removed from CJ: ' + p.name);
+      console.log('  Out of stock/removed: ' + p.name);
     }
-    await sleep(800);
+    await sleep(1200);
   }
-  console.log('Verified ' + verified.length + '/' + products.length + ' products still active on CJ');
+  console.log('Verified ' + verified.length + '/' + products.length + ' products have inventory');
   return verified;
 }
 
@@ -131,18 +134,16 @@ async function fetchCategoryProducts(token, categoryId, categoryName, pageSize) 
 
     var mapped = items
       .filter(function(item) {
-        // Skip products with Chinese characters in name
         var name = item.productName || '';
         if (/[一-鿿]/.test(name)) return false;
-        // Skip if no price
         if (!item.sellPrice || parseFloat(item.sellPrice) <= 0) return false;
-        // Skip very cheap items (likely junk)
         if (parseFloat(item.sellPrice) < 2) return false;
         return true;
       })
       .map(function(item) {
         return {
           cjProductId: item.pid,
+          productSku: item.productSku || null,
           name: item.productName,
           category: categoryName,
           price: parseFloat(item.sellPrice),
