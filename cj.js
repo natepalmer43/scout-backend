@@ -38,42 +38,51 @@ async function getToken() {
 }
 
 async function verifyProduct(p, token) {
-  // Use CJ's inventory-by-pid endpoint — works with product ID, no SKU needed
   if (!p.cjProductId) return true;
 
   try {
-    var res = await axios.get(CJ_BASE + '/product/stock/getInventoryByPid', {
+    // Use product/query to get full product details — check if product is still active
+    var res = await axios.get(CJ_BASE + '/product/query', {
       headers: { 'CJ-Access-Token': token },
       params: { pid: p.cjProductId },
       timeout: 10000,
     });
 
-    // Log raw response for first few products so we can see the actual structure
+    // Log first 5 products so we can see what CJ returns for live vs dead products
     if (!verifyProduct._logCount) verifyProduct._logCount = 0;
-    if (verifyProduct._logCount < 3) {
-      console.log('  [inventory debug] ' + p.name + ': ' + JSON.stringify(res.data).slice(0, 500));
+    if (verifyProduct._logCount < 5) {
+      var d = res.data && res.data.data;
+      console.log('  [verify debug] ' + (p.name || '').slice(0, 50) + ' | result=' + (res.data && res.data.result) + ' | hasData=' + !!d + ' | status=' + (d && d.status) + ' | productType=' + (d && d.productType) + ' | sellPrice=' + (d && d.sellPrice));
       verifyProduct._logCount++;
     }
 
-    if (!res.data || !res.data.result) return true; // API error, assume active
-    var data = res.data.data;
-
-    // If data is null/undefined/empty, product may be removed
-    if (!data) return false;
-
-    // data could be an array of warehouses or an object — handle both
-    var inventories = Array.isArray(data) ? data : (data.inventories || data.list || [data]);
-
-    var totalStock = 0;
-    for (var i = 0; i < inventories.length; i++) {
-      var wh = inventories[i];
-      totalStock += (wh.totalInventoryNum || wh.inventoryNum || wh.qty || 0);
+    // If API says result=false or data is null, product is removed
+    if (!res.data || !res.data.result || !res.data.data) {
+      console.log('  REMOVED (no data): ' + (p.name || '').slice(0, 60));
+      return false;
     }
 
-    return totalStock > 0;
+    var data = res.data.data;
+
+    // Check for status field — if CJ uses one
+    if (data.status !== undefined && data.status !== null) {
+      // Log any non-standard status values
+      if (data.status !== 'ACTIVE' && data.status !== 1 && data.status !== '1') {
+        console.log('  REMOVED (status=' + data.status + '): ' + (p.name || '').slice(0, 60));
+        return false;
+      }
+    }
+
+    // If sellPrice is 0 or missing, product is likely dead
+    if (!data.sellPrice || parseFloat(data.sellPrice) <= 0) {
+      console.log('  REMOVED (no price): ' + (p.name || '').slice(0, 60));
+      return false;
+    }
+
+    return true;
   } catch (err) {
     // If endpoint errors, assume active to avoid over-filtering
-    console.log('  [inventory check error] ' + p.name + ': ' + (err.message || ''));
+    console.log('  [verify error] ' + (p.name || '').slice(0, 50) + ': ' + (err.message || ''));
     return true;
   }
 }
